@@ -1192,19 +1192,19 @@ export class GridBotDB {
   async createOrder(params: Omit<OrderRecord, 'id' | 'created_at' | 'updated_at'>): Promise<number> {
     try {
       const result = await this.dbRun(`
-        INSERT INTO orders (bot_id, order_id, instrument, side, type, quantity, price, status, grid_level_id, metadata)
+        INSERT OR IGNORE INTO orders (bot_id, order_id, instrument, side, type, quantity, price, status, grid_level_id, metadata)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [params.bot_id, params.order_id, params.instrument, params.side, params.type,
           params.quantity, params.price, params.status, params.grid_level_id, params.metadata]);
 
       return result.lastID!;
     } catch (err: any) {
-      if (err.message?.includes('UNIQUE constraint') && 
+      if (err.message?.includes('UNIQUE constraint') &&
           (params.order_id === '0x00' || params.order_id.startsWith('0x000000'))) {
         params.order_id = `temp_${Date.now()}_${params.price}`;
         console.log(`[DB] UNIQUE constraint workaround: renamed to ${params.order_id}`);
         const result = await this.dbRun(`
-          INSERT INTO orders (bot_id, order_id, instrument, side, type, quantity, price, status, grid_level_id, metadata)
+          INSERT OR IGNORE INTO orders (bot_id, order_id, instrument, side, type, quantity, price, status, grid_level_id, metadata)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [params.bot_id, params.order_id, params.instrument, params.side, params.type,
             params.quantity, params.price, params.status, params.grid_level_id, params.metadata]);

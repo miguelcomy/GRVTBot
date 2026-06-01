@@ -1,7 +1,7 @@
 // Grid Trading Engine - Fase 3
 // Lógica completa de grid trading con safeguards para dinero real
 
-import { grvtClient, type GRVTClient, getInstrumentSpec } from '../api/client.js';
+import { grvtClient, type GRVTClient, getInstrumentSpec, isSpecFromApi, roundToTick, roundToStep, instrumentSpecsCache } from '../api/client.js';
 import { getGrvtClientForBot, invalidateGrvtClient } from '../api/grvt-client-factory.js';
 import { db } from '../database/db.js';
 import type { GridBot, GridLevel, OrderRecord } from '../database/db.js';
@@ -105,15 +105,15 @@ export function computeQtyPerLevel(
   const effCap = investmentUsdt * leverage * ORDER_ALLOC;
   const { min_size: minSize, min_notional: minNotional } = getInstrumentSpec(pair);
   let qty = Math.max(
-    Math.ceil((effCap / numGrids / midPrice) * 100) / 100,
-    0.03
+    roundToStep(effCap / numGrids / midPrice, minSize, 'up'),
+    minSize
   );
   // Ensure min notional at lowest likely price
-  
+
   while (qty * midPrice * 0.8 < minNotional) {
     qty += minSize;
   }
-  return Math.round(qty * 100) / 100;
+  return roundToStep(qty, minSize, 'nearest');
 }
 
 /**
@@ -161,6 +161,8 @@ export interface RangeUpdateInputs {
   currentPosition: number;
   existingLevels: Array<Pick<GridLevel, 'order_id' | 'price'>>;
   positionReadError?: string;
+  tickSize?: number;
+  minSize?: number;
 }
 
 const MAX_AUTO_BUY_ETH = 2.0;
@@ -170,10 +172,13 @@ const AUTO_BUY_SLIPPAGE_PCT = 0.5;
 
 export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePlan {
   const { bot, newLower, newUpper, currentPrice, currentPosition, existingLevels, positionReadError } = input;
+  const spec = getInstrumentSpec(bot.pair);
+  const tickSize = input.tickSize ?? spec.tick_size;
+  const minSize = input.minSize ?? spec.min_size;
 
   const noop =
-    Math.abs(newLower - bot.lower_price) < 0.01 &&
-    Math.abs(newUpper - bot.upper_price) < 0.01;
+    Math.abs(newLower - bot.lower_price) < tickSize &&
+    Math.abs(newUpper - bot.upper_price) < tickSize;
 
   const safetyViolations: string[] = [];
 
@@ -210,7 +215,7 @@ export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePla
   const newLevels: Array<{ level_index: number; price: number; side: 'buy' | 'sell'; quantity: number }> = [];
   let sellLevelsCount = 0;
   for (let i = 0; i <= numGrids; i++) {
-    const price = Math.round((newLower + i * newSpacing) * 100) / 100;
+    const price = roundToTick(newLower + i * newSpacing, tickSize);
     const side: 'buy' | 'sell' = price < currentPrice ? 'buy' : 'sell';
     newLevels.push({ level_index: i, price, side, quantity: canonicalQty });
     if (side === 'sell') sellLevelsCount++;
@@ -227,7 +232,7 @@ export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePla
   }
 
   const autoBuyAggressivePrice =
-    Math.ceil(currentPrice * (1 + AUTO_BUY_SLIPPAGE_PCT / 100) * 100) / 100;
+    roundToTick(currentPrice * (1 + AUTO_BUY_SLIPPAGE_PCT / 100), tickSize, 'up');
   const autoBuyEstimatedCost = ethDeficit * autoBuyAggressivePrice;
   const autoBuySlippageCostUsd = ethDeficit * currentPrice * (AUTO_BUY_SLIPPAGE_PCT / 100);
 
@@ -324,9 +329,11 @@ export function decideCompound(
 
 // GRVT maintenance margin used by calculateLiquidationPrice() in the
 // REST client. Kept in sync here for the local per-tick estimate so we
-// don't have to fetch positions on every monitor loop. Verify per pair
-// if GRVT ever publishes per-symbol margin tiers.
-const SAFEGUARD_MAINTENANCE_MARGIN = 0.005;
+// don't have to fetch positions on every monitor loop.
+// Empirically verified from ADA position: entry $0.23, 10x → liq $0.209
+// → effective maintenance ~1%. Using 0.01 as conservative default.
+// Verify per pair if GRVT ever publishes per-symbol margin tiers.
+const SAFEGUARD_MAINTENANCE_MARGIN = 0.01;
 
 /**
  * Local estimate of liquidation price for the safeguard check. Uses the
@@ -847,12 +854,13 @@ export class GridEngine extends EventEmitter {
       // to us. Only trigger RESUME when orders price-match our grid OR there's
       // a real position.
       const botGridLevels = await db.getGridLevels(botId);
-      const gridPrices = botGridLevels.map((l) => Math.round(l.price * 100) / 100);
+      const startBotSpec = getInstrumentSpec(bot.pair);
+      const gridPrices = botGridLevels.map((l) => roundToTick(l.price, startBotSpec.tick_size));
       let matchingOrders = 0;
       for (const order of existingOrders) {
         const leg = (order as any).legs?.[0];
         if (!leg?.limit_price) continue;
-        const op = Math.round(parseFloat(leg.limit_price) * 100) / 100;
+        const op = roundToTick(parseFloat(leg.limit_price), startBotSpec.tick_size);
         if (gridPrices.some((gp) => Math.abs(gp - op) < 0.5)) matchingOrders++;
       }
       const orphanOrders = existingOrders.length - matchingOrders;
@@ -888,8 +896,53 @@ export class GridEngine extends EventEmitter {
         log.info(`🆕 Bot ${botId} FRESH START — no matching GRVT state, bootstrapping.`);
         // Verificar balance antes de iniciar
         await this.validateSufficientBalance(bot);
-        // Establecer leverage
-        await client.setLeverage(bot.pair, bot.leverage);
+
+        // ── LEVERAGE VERIFICATION ──────────────────────────────────────
+        // GRVT does NOT expose a REST API to set or read the configured
+        // leverage for an instrument. The user must set it manually in the
+        // GRVT UI. We verify by reading the open position (if any) which
+        // includes a `leverage` field, and warn if it doesn't match.
+        // If no position exists yet, we attempt setLeverage as best-effort
+        // and warn that the endpoint may not exist (404).
+        const existingPositionForLeverage = await client.getPosition(bot.pair);
+        if (existingPositionForLeverage) {
+          const grvtLeverage = parseFloat(
+            (existingPositionForLeverage as any).leverage || '0'
+          );
+          if (grvtLeverage > 0 && Math.abs(grvtLeverage - bot.leverage) > 0.01) {
+            throw new Error(
+              `Leverage mismatch: bot is configured to ${bot.leverage}x but GRVT shows ${grvtLeverage}x ` +
+              `for ${bot.pair}. Adjust the leverage in the GRVT UI to ${bot.leverage}x before starting.`
+            );
+          }
+        } else {
+          // No position yet — attempt to set leverage. If it fails (404),
+          // log a clear warning but do NOT abort: GRVT's default may be
+          // correct. The liquidation guard below will catch mismatches.
+          const leverageOk = await client.setLeverage(bot.pair, bot.leverage);
+          if (!leverageOk) {
+            log.warn(
+              `⚠️ setLeverage(${bot.leverage}x) failed for ${bot.pair}. ` +
+              `GRVT may not support this API. Verify leverage in the GRVT UI matches ${bot.leverage}x.`
+            );
+          }
+        }
+
+        // ── LIQUIDATION SAFETY GUARD ──────────────────────────────────
+        // Estimate the liquidation price with a conservative maintenance
+        // margin (1.0%) and verify the grid floor is safely BELOW it.
+        // This prevents the exact scenario where leverage is higher than
+        // expected and liquidation falls inside the grid range.
+        const liqEstimate = computeLiqPriceLocal(bot);
+        if (liqEstimate !== null && bot.direction === 'long' && liqEstimate >= bot.lower_price) {
+          throw new Error(
+            `Liquidation risk: estimated liq price $${liqEstimate.toFixed(4)} ` +
+            `is at or above the grid floor $${bot.lower_price}. ` +
+            `Reduce leverage or raise the grid lower price. ` +
+            `(entry ~$${bot.avg_entry_price || '?'}, leverage ${bot.leverage}x)`
+          );
+        }
+
         // Colocar órdenes iniciales
         await instance.placeInitialOrders();
       }
@@ -1215,8 +1268,9 @@ export class GridEngine extends EventEmitter {
       if (Date.now() - lastShift < 3600_000) continue; // max once/hour
 
       const rangeWidth = bot.upper_price - bot.lower_price;
-      const newLower = Math.round((req.currentPrice - rangeWidth / 2) * 100) / 100;
-      const newUpper = Math.round((req.currentPrice + rangeWidth / 2) * 100) / 100;
+      const shiftSpec = getInstrumentSpec(bot.pair);
+      const newLower = roundToTick(req.currentPrice - rangeWidth / 2, shiftSpec.tick_size);
+      const newUpper = roundToTick(req.currentPrice + rangeWidth / 2, shiftSpec.tick_size);
       const fromRange = { lower: bot.lower_price, upper: bot.upper_price };
 
       log.info(
@@ -1285,19 +1339,19 @@ export class GridEngine extends EventEmitter {
     const ORDER_ALLOC = 0.75;
     const midPrice = (config.lowerPrice + config.upperPrice) / 2;
     const effCap = config.investmentUSDT * config.leverage * ORDER_ALLOC;
-    const { min_notional: minNotional, min_size: minSize } = getInstrumentSpec(config.pair);
-    
+    const calcSpec = getInstrumentSpec(config.pair);
+
     let canonicalQty = Math.max(
-      Math.ceil((effCap / config.numGrids / midPrice) * 100) / 100,
-      0.03
+      roundToStep(effCap / config.numGrids / midPrice, calcSpec.min_size, 'up'),
+      calcSpec.min_size
     );
     // Ensure min notional at the LOWEST price (worst-case for buy levels):
     // a 0.03 qty at $1800 = $54 which is well above $20, so this is
     // usually a no-op, but keep it as defense in depth.
-    while (canonicalQty * config.lowerPrice < minNotional) {
-      canonicalQty += minSize;
+    while (canonicalQty * config.lowerPrice < calcSpec.min_notional) {
+      canonicalQty += calcSpec.min_size;
     }
-    canonicalQty = Math.round(canonicalQty * 100) / 100;
+    canonicalQty = roundToStep(canonicalQty, calcSpec.min_size, 'nearest');
 
     log.info(`🧮 Grid calculation: ${config.numGrids} grids = ${config.numGrids + 1} niveles`);
     log.info(`🧮 Rango: $${config.lowerPrice} - $${config.upperPrice}`);
@@ -1308,7 +1362,7 @@ export class GridEngine extends EventEmitter {
     // gets the SAME canonicalQty so the grid is constant-quantity.
     const gridLevels = [];
     for (let i = 0; i <= config.numGrids; i++) {
-      const price = Math.round((config.lowerPrice + (i * spacing)) * 100) / 100;
+      const price = roundToTick(config.lowerPrice + (i * spacing), calcSpec.tick_size);
 
       let side: 'buy' | 'sell';
       if (config.direction === 'long') {
@@ -1383,17 +1437,57 @@ export class GridEngine extends EventEmitter {
     // returns safe defaults. Any pair with min_size/min_notional > 0 is
     // acceptable here; per-bot validation happens on order placement.
 
+    const vSpec = getInstrumentSpec(config.pair);
+
+    // Guard: refuse creation if spec came from fallback (not confirmed by API).
+    // A guessed tick_size on money real can cause order rejections or grid collapse.
+    if (!isSpecFromApi(config.pair) && !instrumentSpecsCache.has(config.pair)) {
+      throw new Error(
+        `Instrument spec for ${config.pair} not confirmed by GRVT API. ` +
+        `Start the engine first so /instruments populates the cache, or add ${config.pair} to the hardcoded fallback.`
+      );
+    }
+
+    // Guard: tick_size must support the requested number of levels.
+    const rangeTicks = (config.upperPrice - config.lowerPrice) / vSpec.tick_size;
+    if (rangeTicks < config.numGrids) {
+      const maxLevels = Math.floor(rangeTicks);
+      throw new Error(
+        `Tick too coarse for ${config.numGrids} grids on ${config.pair}: ` +
+        `range $${config.lowerPrice}–$${config.upperPrice} ÷ tick $${vSpec.tick_size} = ${rangeTicks.toFixed(1)} ticks. ` +
+        `Maximum ${maxLevels} levels possible.`
+      );
+    }
+
     // ⚠️ NUEVO: Validar min_notional por grid (con leverage)
     const effectiveCapital = config.investmentUSDT * config.leverage;
     const investmentPerGrid = effectiveCapital / config.numGrids;
-    const { min_notional: minNotional, min_size: minSize } = getInstrumentSpec(config.pair);
-    
-    if (investmentPerGrid < minNotional) {
-      const maxGrids = Math.floor((config.investmentUSDT * config.leverage) / minNotional);
-      throw new Error(`Con $${config.investmentUSDT} de inversión, máximo ${maxGrids} grids (mín $${minNotional} por grid para ${config.pair})`);
+
+    if (investmentPerGrid < vSpec.min_notional) {
+      const maxGrids = Math.floor((config.investmentUSDT * config.leverage) / vSpec.min_notional);
+      throw new Error(`Con $${config.investmentUSDT} de inversión, máximo ${maxGrids} grids (mín $${vSpec.min_notional} por grid para ${config.pair})`);
     }
 
-    log.info(`✅ [DEBUG] Configuración validada: ${config.numGrids} grids x $${investmentPerGrid.toFixed(2)} cada uno >= $${minNotional} min_notional`);
+    log.info(`✅ [DEBUG] Configuración validada: ${config.numGrids} grids x $${investmentPerGrid.toFixed(2)} cada uno >= $${vSpec.min_notional} min_notional`);
+
+    // Guard: grid floor must be below estimated liquidation price for longs.
+    // With leverage L and maintenance margin M, liq ≈ entry × (1 - 1/L + M).
+    // Use current mid-price as entry estimate since the bot hasn't opened yet.
+    if (config.direction === 'long') {
+      const estimatedEntry = (config.lowerPrice + config.upperPrice) / 2;
+      const factor = 1 / config.leverage - SAFEGUARD_MAINTENANCE_MARGIN;
+      if (factor > 0) {
+        const estimatedLiq = estimatedEntry * (1 - factor);
+        if (estimatedLiq >= config.lowerPrice) {
+          throw new Error(
+            `Liquidation risk at ${config.leverage}x: estimated liq $${estimatedLiq.toFixed(4)} ` +
+            `is at or above grid floor $${config.lowerPrice}. ` +
+            `Reduce leverage (try ${Math.min(Math.floor(1 / (1 - config.lowerPrice / estimatedEntry + 0.01)), 20)}x or less) ` +
+            `or raise the grid lower price above $${estimatedLiq.toFixed(4)}.`
+          );
+        }
+      }
+    }
   }
 
   /**
@@ -1653,7 +1747,8 @@ export class GridEngine extends EventEmitter {
           const size = Math.max(minSize, Math.floor((bot.dca_amount_usdt / price) * 10000) / 10000);
 
           // Aggressive limit (0.5% above market) to ensure fill
-          const aggressivePrice = Math.ceil(price * 1.005 * 100) / 100;
+          const dcaSpec = getInstrumentSpec(bot.pair);
+          const aggressivePrice = roundToTick(price * 1.005, dcaSpec.tick_size, 'up');
 
           await client.createOrder({
             sub_account_id: client.subAccountId,
@@ -1846,6 +1941,8 @@ export class GridEngine extends EventEmitter {
       currentPosition,
       existingLevels,
       positionReadError,
+      tickSize: getInstrumentSpec(bot.pair).tick_size,
+      minSize: getInstrumentSpec(bot.pair).min_size,
     });
   }
 
@@ -2225,7 +2322,8 @@ export class GridBotInstance {
     const rangeMin = levels.length > 0 ? levels[0]!.price : 1800;
     const rangeMax = levels.length > 0 ? levels[levels.length - 1]!.price : 2450;
     const midPrice = (rangeMin + rangeMax) / 2;
-    return Math.max(Math.ceil((effCap / (this.bot.num_grids || 94) / midPrice) * 100) / 100, 0.03);
+    const legacySpec = getInstrumentSpec(this.bot.pair);
+    return Math.max(roundToStep(effCap / (this.bot.num_grids || 94) / midPrice, legacySpec.min_size, 'up'), legacySpec.min_size);
   }
 
   getActiveOrderCount(): number {
@@ -2269,9 +2367,9 @@ export class GridBotInstance {
       await this.executeInitialPurchase(currentPrice);
     }
 
-    // ⚠️ DRY RUN warning
-    if (process.env.DRY_RUN === 'true') {
-      log.info(`🧪 [DRY RUN] Bot ${this.bot.id}: Modo testing activado - NO se colocarán órdenes reales`);
+    // ⚠️ DRY RUN / MOCK warning
+    if (process.env.DRY_RUN === 'true' || this.grvt.mockMode) {
+      log.info(`🧪 [MOCK] Bot ${this.bot.id}: Modo testing activado - órdenes simuladas`);
     }
 
     let ordersToPlace = 0;
@@ -2380,7 +2478,7 @@ export class GridBotInstance {
     }
 
     try {
-      if (process.env.DRY_RUN === 'true') {
+      if (process.env.DRY_RUN === 'true' || this.grvt.mockMode) {
         log.info(`🧪 [DRY RUN] Bot ${this.bot.id}: COMPRA INICIAL que se ejecutaría: BUY ${totalQuantityNeeded} ${this.bot.pair} @ MARKET [notional: $${notionalUSDT.toFixed(2)}]`);
         
         // En dry run, simular la compra
@@ -2399,12 +2497,13 @@ export class GridBotInstance {
       // Usar precio ligeramente arriba del ask para asegurar fill
       const ticker = await this.grvt.getTicker(this.bot.pair);
       const askPrice = parseFloat((ticker as any).best_ask_price || (ticker as any).best_ask || ticker.last_price);
-      const safeBuyPrice = Math.floor(askPrice * 1.001 * 100) / 100; // 0.1% arriba del ask, rounded to tick
+      const initSpec = getInstrumentSpec(this.bot.pair);
+      const safeBuyPrice = roundToTick(askPrice * 1.001, initSpec.tick_size, 'up'); // 0.1% arriba del ask, rounded to tick
 
       const order = await this.grvt.createOrder({
         sub_account_id: process.env.GRVT_TRADING_ACCOUNT_ID!,
         instrument: this.bot.pair,
-        size: (Math.floor(totalQuantityNeeded * 100) / 100).toString(), // Round to 0.01
+        size: roundToStep(totalQuantityNeeded, initSpec.min_size, 'down').toString(),
         price: safeBuyPrice.toString(),
         side: 'buy',
         type: 'limit', // IOC es tipo limit con time_in_force especial
@@ -2611,8 +2710,8 @@ export class GridBotInstance {
 
       log.info(`✅ [DEBUG] Min_notional OK: $${notional.toFixed(2)} >= $${minNotional}`);
 
-      // 🧪 DRY RUN MODE: Solo loguear las órdenes que se colocarían
-      if (process.env.DRY_RUN === 'true') {
+      // 🧪 DRY RUN / MOCK MODE: Solo loguear las órdenes que se colocarían
+      if (process.env.DRY_RUN === 'true' || this.grvt.mockMode) {
         log.info(`🧪 [DRY RUN] ORDEN QUE SE COLOCARÍA: ${level.side.toUpperCase()} ${level.quantity} ${this.bot.pair} @ $${level.price} (nivel ${level.level_index}) [notional: $${notional.toFixed(2)}]`);
         
         // En dry run, crear orden fake en database para testing
@@ -2673,9 +2772,10 @@ export class GridBotInstance {
         
         // Buscar la orden por precio en open_orders
         const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
+        const tickSize = getInstrumentSpec(this.bot.pair).tick_size;
         const match = openOrders.find((o: any) => {
           const orderPrice = o.legs?.[0]?.limit_price ? parseFloat(o.legs[0].limit_price) : 0;
-          return Math.abs(orderPrice - level.price) < 1.0;
+          return Math.abs(orderPrice - level.price) < tickSize;
         });
         if (match) {
           realOrderId = match.order_id;
@@ -2804,12 +2904,13 @@ export class GridBotInstance {
     }
 
     // 3. Build set of GRVT prices (rounded) for coverage check
+    const monSpec = getInstrumentSpec(this.bot.pair);
     const grvtPriceSet = new Set<number>();
     const grvtOrderMap = new Map<number, any>(); // price → {order_id, side}
     for (const order of openOrders) {
       const leg = (order as any).legs?.[0];
       if (!leg?.limit_price) continue;
-      const price = Math.round(parseFloat(leg.limit_price) * 100) / 100;
+      const price = roundToTick(parseFloat(leg.limit_price), monSpec.tick_size);
       grvtPriceSet.add(price);
       grvtOrderMap.set(price, {
         order_id: order.order_id,
@@ -2837,7 +2938,7 @@ export class GridBotInstance {
       // H.8: skip virtual levels — they're supposed to have no order
       if (isVirtual && level.state === 'virtual') continue;
 
-      const lp = Math.round(level.price * 100) / 100;
+      const lp = roundToTick(level.price, monSpec.tick_size);
 
       // Check if GRVT has an order at this price. Tolerance must be tight
       // enough that adjacent grid levels can never alias to the same order.
@@ -2895,6 +2996,7 @@ export class GridBotInstance {
       const recentFills = await this.grvt.getFillHistory(50, this.bot.pair!);
       const archivedFills = await db.findRecentFillsForBot(this.bot.id, 90_000);
       const now = Date.now();
+      const fillTickSize = getInstrumentSpec(this.bot.pair!).tick_size;
 
       for (let i = 1; i < uncoveredLevels.length; i++) {
         const uc = uncoveredLevels[i]!;
@@ -2903,14 +3005,14 @@ export class GridBotInstance {
         const fillMatch = recentFills.find((fill: any) => {
           const fp = parseFloat(fill.price);
           const ft = parseInt(fill.event_time || '0') / 1e6;
-          return Math.abs(fp - uc.level.price) < 1.0 && (now - ft) < 90000;
+          return Math.abs(fp - uc.level.price) < fillTickSize && (now - ft) < 90000;
         });
 
         // Fallback: check local archive (WS-backed, fresher than REST).
         // Critical for aggressive candles that fill a just-placed counter
         // before REST getFillHistory catches up.
         const archiveMatch = !fillMatch ? archivedFills.find(f =>
-          Math.abs(f.price - uc.level.price) < 1.0
+          Math.abs(f.price - uc.level.price) < fillTickSize
         ) : null;
 
         if (fillMatch || archiveMatch) {
