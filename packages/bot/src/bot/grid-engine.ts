@@ -2764,22 +2764,36 @@ export class GridBotInstance {
 
       log.info({ order }, 'REAL MODE - Respuesta de GRVT createOrder');
 
-      // Si GRVT devuelve 0x00, buscar el order_id real en open_orders
+      // Si GRVT devuelve 0x00, buscar el order_id real en open_orders.
+      // GRVT truncates limit_price to 2 decimals in responses, so a level at
+      // $0.2264 comes back as $0.23. We use a wider tolerance (0.005 = half cent)
+      // and disambiguate by picking the closest match when multiple candidates
+      // fall within the bucket.
       let realOrderId = order.order_id;
       if (realOrderId === '0x00' || realOrderId === '0x0000000000000000000000000000000000000000000000000000000000000000') {
-        // Esperar 1 segundo para que GRVT procese
-        await new Promise(r => setTimeout(r, 1000));
-        
-        // Buscar la orden por precio en open_orders
+        await new Promise(r => setTimeout(r, 2000));
+
         const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
-        const tickSize = getInstrumentSpec(this.bot.pair).tick_size;
-        const match = openOrders.find((o: any) => {
+        // GRVT truncates to 2 decimals: tolerance of 0.005 covers the full
+        // ±0.005 range around each 2-decimal bucket boundary.
+        const tolerance = 0.005;
+        const candidates = openOrders.filter((o: any) => {
           const orderPrice = o.legs?.[0]?.limit_price ? parseFloat(o.legs[0].limit_price) : 0;
-          return Math.abs(orderPrice - level.price) < tickSize;
+          return Math.abs(orderPrice - level.price) < tolerance;
         });
-        if (match) {
-          realOrderId = match.order_id;
+        if (candidates.length === 1) {
+          realOrderId = (candidates[0] as any).order_id;
           log.info(`[0x00 FIX] Replaced 0x00 with real order_id: ${realOrderId.slice(0,20)}... @ $${level.price}`);
+        } else if (candidates.length > 1) {
+          // Multiple orders in same 2-decimal bucket — pick closest.
+          // This can happen during bootstrap when many orders land at once.
+          candidates.sort((a: any, b: any) => {
+            const da = Math.abs(parseFloat(a.legs?.[0]?.limit_price || '0') - level.price);
+            const db = Math.abs(parseFloat(b.legs?.[0]?.limit_price || '0') - level.price);
+            return da - db;
+          });
+          realOrderId = (candidates[0] as any).order_id;
+          log.info(`[0x00 FIX] Ambiguous match (${candidates.length} candidates) — picked closest: ${realOrderId.slice(0,20)}... @ $${level.price}`);
         } else {
           realOrderId = `temp_${Date.now()}_${level.price}_${Math.random().toString(36).slice(2,8)}`;
           log.info(`[0x00 FIX] Generated temp ID: ${realOrderId} for $${level.price}`);
@@ -2903,19 +2917,29 @@ export class GridBotInstance {
       }
     }
 
-    // 3. Build set of GRVT prices (rounded) for coverage check
+    // 3. Build maps of GRVT orders for coverage check.
+    // GRVT truncates limit_price to 2 decimal places in open_orders responses
+    // (e.g. a level at $0.2264 is returned as $0.23). To match correctly we
+    // use order_id as the primary key (from our activeOrders map) and fall
+    // back to price-based matching with a wider tolerance when order_id is
+    // unknown (temp IDs, cold starts).
     const monSpec = getInstrumentSpec(this.bot.pair);
-    const grvtPriceSet = new Set<number>();
-    const grvtOrderMap = new Map<number, any>(); // price → {order_id, side}
+    const grvtOrdersById = new Map<string, { price: number; side: string }>();
+    const grvtPrices = new Map<number, { order_id: string; side: string }>();
     for (const order of openOrders) {
       const leg = (order as any).legs?.[0];
       if (!leg?.limit_price) continue;
       const price = roundToTick(parseFloat(leg.limit_price), monSpec.tick_size);
-      grvtPriceSet.add(price);
-      grvtOrderMap.set(price, {
-        order_id: order.order_id,
-        side: leg.is_buying_asset ? 'buy' : 'sell'
+      grvtOrdersById.set(order.order_id, {
+        price,
+        side: leg.is_buying_asset ? 'buy' : 'sell',
       });
+      if (!grvtPrices.has(price)) {
+        grvtPrices.set(price, {
+          order_id: order.order_id,
+          side: leg.is_buying_asset ? 'buy' : 'sell',
+        });
+      }
     }
 
     // 4. Get grid levels and sync DB with GRVT reality.
@@ -2927,12 +2951,24 @@ export class GridBotInstance {
     const uncoveredLevels: { level: any, price: number, dist: number }[] = [];
     const isVirtual = !!this.bot.virtual_enabled;
 
-    // Match tolerance: must be < gridStep/2, otherwise a single GRVT order
-    // can match two adjacent DB levels and the loser gets re-placed → duplicate.
-    // Real bug from bot 48 (SOL, step=0.25): old fixed 0.5 tolerance caused
-    // perpetual duplicate→kill cycles around the entry price.
+    // Match tolerance: GRVT truncates limit_price to 2 decimals. Multiple
+    // grid levels (spacing 0.0018) can round to the same 2-decimal bucket.
+    // Primary matching is by order_id (from activeOrders); price tolerance
+    // is a fallback for cold-start when activeOrders is empty.
     const gridStep = (this.bot.upper_price - this.bot.lower_price) / this.bot.num_grids;
-    const matchTolerance = Math.min(0.05, gridStep / 3);
+    const matchTolerance = Math.min(0.005, gridStep / 2);
+
+    // Build reverse map: grid_level_id → level, and level.order_id → level
+    // for order_id-based matching when the level has a real GRVT order_id.
+    const levelByOrderId = new Map<string, any>();
+    for (const level of gridLevels) {
+      if (level.order_id && level.order_id !== '0x00' && !level.order_id.startsWith('temp_')) {
+        levelByOrderId.set(level.order_id, level);
+      }
+    }
+
+    // Track which GRVT orders have been consumed to prevent double-matching.
+    const consumedOrderIds = new Set<string>();
 
     for (const level of gridLevels) {
       // H.8: skip virtual levels — they're supposed to have no order
@@ -2940,26 +2976,42 @@ export class GridBotInstance {
 
       const lp = roundToTick(level.price, monSpec.tick_size);
 
-      // Check if GRVT has an order at this price. Tolerance must be tight
-      // enough that adjacent grid levels can never alias to the same order.
+      // Check if GRVT has an order for this level. Prefer order_id match
+      // (exact, no ambiguity) then fall back to price-based matching.
       let covered = false;
-      for (const gp of grvtPriceSet) {
-        if (Math.abs(gp - lp) < matchTolerance) {
-          // Covered — sync DB with GRVT order_id and force state back to
-          // 'active' (a level with a live GRVT order is, by definition,
-          // active — clears stale 'filled'/'virtual' from earlier cycles).
-          const grvtOrder = grvtOrderMap.get(gp);
-          if (grvtOrder) {
+
+      // Strategy 1: match by order_id stored in the level (if we previously
+      // resolved the real GRVT order_id via the 0x00 fix or monitor sync).
+      if (level.order_id && level.order_id !== '0x00' && !level.order_id.startsWith('temp_')) {
+        const grvtOrder = grvtOrdersById.get(level.order_id);
+        if (grvtOrder && !consumedOrderIds.has(level.order_id)) {
+          await db.updateGridLevel(level.id, {
+            order_id: level.order_id,
+            side: grvtOrder.side as 'buy' | 'sell',
+            is_filled: false,
+            state: 'active'
+          });
+          consumedOrderIds.add(level.order_id);
+          covered = true;
+        }
+      }
+
+      // Strategy 2: match by price with tolerance (fallback for cold-start
+      // or when the level only has a temp order_id).
+      if (!covered) {
+        for (const [gp, grvtOrder] of grvtPrices) {
+          if (consumedOrderIds.has(grvtOrder.order_id)) continue;
+          if (Math.abs(gp - lp) < matchTolerance) {
             await db.updateGridLevel(level.id, {
               order_id: grvtOrder.order_id,
-              side: grvtOrder.side,
+              side: grvtOrder.side as 'buy' | 'sell',
               is_filled: false,
               state: 'active'
             });
+            consumedOrderIds.add(grvtOrder.order_id);
+            covered = true;
+            break;
           }
-          grvtPriceSet.delete(gp); // consume to prevent double-match
-          covered = true;
-          break;
         }
       }
 
@@ -2996,7 +3048,7 @@ export class GridBotInstance {
       const recentFills = await this.grvt.getFillHistory(50, this.bot.pair!);
       const archivedFills = await db.findRecentFillsForBot(this.bot.id, 90_000);
       const now = Date.now();
-      const fillTickSize = getInstrumentSpec(this.bot.pair!).tick_size;
+      const fillTolerance = 0.005;
 
       for (let i = 1; i < uncoveredLevels.length; i++) {
         const uc = uncoveredLevels[i]!;
@@ -3005,14 +3057,14 @@ export class GridBotInstance {
         const fillMatch = recentFills.find((fill: any) => {
           const fp = parseFloat(fill.price);
           const ft = parseInt(fill.event_time || '0') / 1e6;
-          return Math.abs(fp - uc.level.price) < fillTickSize && (now - ft) < 90000;
+          return Math.abs(fp - uc.level.price) < fillTolerance && (now - ft) < 90000;
         });
 
         // Fallback: check local archive (WS-backed, fresher than REST).
         // Critical for aggressive candles that fill a just-placed counter
         // before REST getFillHistory catches up.
         const archiveMatch = !fillMatch ? archivedFills.find(f =>
-          Math.abs(f.price - uc.level.price) < fillTickSize
+          Math.abs(f.price - uc.level.price) < fillTolerance
         ) : null;
 
         if (fillMatch || archiveMatch) {

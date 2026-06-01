@@ -174,15 +174,69 @@ export interface InstrumentSpec {
   base_decimals?: number;
 }
 
-const instrumentSpecsCache = new Map<string, InstrumentSpec>([
+export const instrumentSpecsCache = new Map<string, InstrumentSpec>([
   ['BTC_USDT_Perp', { min_size: 0.001, min_notional: 100, tick_size: 0.1, instrument_hash: '0x030501', base_decimals: 9 }],
   ['ETH_USDT_Perp', { min_size: 0.001, min_notional: 20, tick_size: 0.01, instrument_hash: '0x030401', base_decimals: 9 }],
   ['SOL_USDT_Perp', { min_size: 0.01, min_notional: 5, tick_size: 0.01, base_decimals: 9 }],
+  ['ADA_USDT_Perp', { min_size: 1, min_notional: 5, tick_size: 0.0001, instrument_hash: '0x032101', base_decimals: 6 }],
 ]);
+
+/** Whether the spec came from the API or is a hardcoded/fallback default. */
+export function isSpecFromApi(pair: string): boolean {
+  // The cache is populated by getInstruments() on engine startup. If the pair
+  // is in the initial hardcoded cache (set above), treat it as fallback —
+  // the API call may or may not have overwritten it yet. Track that separately.
+  return apiPopulatedPairs.has(pair);
+}
+
+/** Pairs whose spec was confirmed by a real GRVT /instruments response. */
+const apiPopulatedPairs = new Set<string>();
 
 /** Get instrument specs — falls back to conservative defaults for unknown pairs. */
 export function getInstrumentSpec(pair: string): InstrumentSpec {
   return instrumentSpecsCache.get(pair) ?? { min_size: 0.01, min_notional: 5, tick_size: 0.01, base_decimals: 9 };
+}
+
+/** Count decimal places of a positive number (e.g. 0.0001 → 4, 0.01 → 2, 1 → 0). */
+function decimalPlaces(n: number): number {
+  if (n >= 1) return 0;
+  let d = 0;
+  let x = n;
+  while (x < 1 && d < 20) { x *= 10; d++; }
+  return d;
+}
+
+/**
+ * Round a price to the nearest valid tick for the instrument.
+ * Safe for small tick sizes (0.0001, 0.00001) — avoids floating-point drift.
+ *
+ * mode:
+ *   'nearest' — round to closest tick (default, for grid level generation)
+ *   'down'    — round toward zero (conservative sell: don't overprice)
+ *   'up'      — round away from zero (aggressive buy: ensure fill)
+ */
+export function roundToTick(price: number, tickSize: number, mode: 'nearest' | 'down' | 'up' = 'nearest'): number {
+  const steps = price / tickSize;
+  let rounded: number;
+  if (mode === 'nearest') rounded = Math.round(steps);
+  else if (mode === 'down') rounded = Math.floor(steps);
+  else rounded = Math.ceil(steps);
+  const raw = rounded * tickSize;
+  return parseFloat(raw.toFixed(decimalPlaces(tickSize)));
+}
+
+/**
+ * Round a quantity to the instrument's step size (min_size).
+ * Defaults to 'down' to avoid exceeding position targets.
+ */
+export function roundToStep(qty: number, stepSize: number, mode: 'down' | 'nearest' | 'up' = 'down'): number {
+  const steps = qty / stepSize;
+  let rounded: number;
+  if (mode === 'nearest') rounded = Math.round(steps);
+  else if (mode === 'down') rounded = Math.floor(steps);
+  else rounded = Math.ceil(steps);
+  const raw = rounded * stepSize;
+  return parseFloat(raw.toFixed(decimalPlaces(stepSize)));
 }
 
 /**
@@ -211,17 +265,19 @@ export class GRVTClient {
   private creds: GrvtClientCreds | null;
   // Per-instance auth state so each user's cookie session is isolated.
   private instanceAuthState: import('./auth.js').AuthState;
+  /** True when MOCK_MODE or DRY_RUN is active — API calls return simulated data. */
+  readonly mockMode: boolean;
 
   constructor(creds?: GrvtClientCreds) {
     this.instanceAuthState = createEmptyAuthState();
     this.creds = creds ?? null;
+    this.mockMode = process.env.MOCK_MODE === 'true' || process.env.DRY_RUN === 'true';
 
     if (creds) {
       this.tradingAccountId = creds.subAccountId;
     } else {
       // Legacy fallback: read from env.
-      const isMockMode = process.env.MOCK_MODE === 'true' || process.env.DRY_RUN === 'true';
-      this.tradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID || (isMockMode ? 'mock-account' : '');
+      this.tradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID || (this.mockMode ? 'mock-account' : '');
       if (!this.tradingAccountId) {
         throw new Error('GRVT_TRADING_ACCOUNT_ID no encontrado en .env (set MOCK_MODE=true to bypass for development)');
       }
@@ -311,6 +367,7 @@ export class GRVTClient {
             ? parseInt(String(inst.base_decimals), 10)
             : 9;
           if (minSize > 0) {
+            apiPopulatedPairs.add(name);
             instrumentSpecsCache.set(name, {
               min_size: minSize,
               min_notional: minNotional,
@@ -375,6 +432,17 @@ export class GRVTClient {
    * Obtener balance de la cuenta trading
    */
   async getBalance(): Promise<Balance> {
+    if (this.mockMode) {
+      return {
+        sub_account_id: this.tradingAccountId,
+        total_equity: '10000',
+        available_balance: '10000',
+        margin_used: '0',
+        maintenance_margin: '0',
+        initial_margin: '0',
+        currency: 'USDT'
+      };
+    }
     await rateLimiter.waitIfNeeded();
     
     const data = await this.authedRequest(`${TRADING_URL}/account_summary`, {
@@ -396,8 +464,9 @@ export class GRVTClient {
    * Obtener todas las posiciones
    */
   async getPositions(): Promise<Position[]> {
+    if (this.mockMode) return [];
     await rateLimiter.waitIfNeeded();
-    
+
     const data = await this.authedRequest(`${TRADING_URL}/positions`, { sub_account_id: this.tradingAccountId });
     return Array.isArray(data) ? data : [];
   }
@@ -414,6 +483,7 @@ export class GRVTClient {
    * Obtener órdenes abiertas
    */
   async getOpenOrders(instrument?: string): Promise<Order[]> {
+    if (this.mockMode) return [];
     await rateLimiter.waitIfNeeded();
 
     const body: any = { sub_account_id: this.tradingAccountId };
@@ -444,6 +514,24 @@ export class GRVTClient {
    * ⚠️ ACTUALIZADO: endpoint /full/v1/create_order con formato verificado
    */
   async createOrder(request: CreateOrderRequest, allowMarket: boolean = false): Promise<Order> {
+    if (this.mockMode) {
+      const mockOrderId = `mock-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      console.log(`📝 [MOCK] Orden simulada: ${request.side} ${request.size} ${request.instrument} @ ${request.price} → ${mockOrderId}`);
+      return {
+        order_id: mockOrderId,
+        sub_account_id: request.sub_account_id || this.tradingAccountId,
+        instrument: request.instrument,
+        size: request.size,
+        filled_size: request.size,
+        price: request.price || '0',
+        side: request.side,
+        type: request.type,
+        status: 'open',
+        time_in_force: request.time_in_force || 'gtc',
+        created_time: Date.now(),
+        updated_time: Date.now(),
+      } as Order;
+    }
     await rateLimiter.waitIfNeeded();
     
     // SAFEGUARD: Solo órdenes LIMIT excepto casos especiales (compra inicial/cierre)
@@ -517,6 +605,10 @@ export class GRVTClient {
    * Cancelar orden específica
    */
   async cancelOrder(orderId: string, instrument: string): Promise<boolean> {
+    if (this.mockMode) {
+      console.log(`❌ [MOCK] Cancelando orden ${orderId} (simulado)`);
+      return true;
+    }
     await rateLimiter.waitIfNeeded();
     
     console.log(`❌ Cancelando orden: ${orderId}`);
@@ -538,6 +630,10 @@ export class GRVTClient {
    * Cancelar todas las órdenes (por instrumento o todas)
    */
   async cancelAllOrders(instrument?: string): Promise<number> {
+    if (this.mockMode) {
+      console.log(instrument ? `❌ [MOCK] Cancelando todas las órdenes de ${instrument}` : '❌ [MOCK] Cancelando TODAS las órdenes');
+      return 0;
+    }
     await rateLimiter.waitIfNeeded();
     
     console.log(instrument ? 
@@ -565,6 +661,10 @@ export class GRVTClient {
    * Establecer leverage para un instrumento
    */
   async setLeverage(instrument: string, leverage: number): Promise<boolean> {
+    if (this.mockMode) {
+      console.log(`⚡ [MOCK] Leverage ${leverage}x para ${instrument} (simulado)`);
+      return true;
+    }
     await rateLimiter.waitIfNeeded();
     
     console.log(`⚡ Estableciendo leverage ${leverage}x para ${instrument}`);
@@ -613,6 +713,7 @@ export class GRVTClient {
     instrument?: string,
     endTimeNs?: string
   ): Promise<Fill[]> {
+    if (this.mockMode) return [];
     await rateLimiter.waitIfNeeded();
 
     const body: any = {
