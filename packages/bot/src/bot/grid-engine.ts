@@ -2925,21 +2925,16 @@ export class GridBotInstance {
     // unknown (temp IDs, cold starts).
     const monSpec = getInstrumentSpec(this.bot.pair);
     const grvtOrdersById = new Map<string, { price: number; side: string }>();
-    const grvtPrices = new Map<number, { order_id: string; side: string }>();
+    // Use a list instead of a Map to handle multiple GRVT orders at the same
+    // truncated price (e.g. levels $0.2264 and $0.2282 both show as $0.23).
+    const grvtOrdersList: Array<{ order_id: string; price: number; side: string }> = [];
     for (const order of openOrders) {
       const leg = (order as any).legs?.[0];
       if (!leg?.limit_price) continue;
       const price = roundToTick(parseFloat(leg.limit_price), monSpec.tick_size);
-      grvtOrdersById.set(order.order_id, {
-        price,
-        side: leg.is_buying_asset ? 'buy' : 'sell',
-      });
-      if (!grvtPrices.has(price)) {
-        grvtPrices.set(price, {
-          order_id: order.order_id,
-          side: leg.is_buying_asset ? 'buy' : 'sell',
-        });
-      }
+      const side = leg.is_buying_asset ? 'buy' : 'sell';
+      grvtOrdersById.set(order.order_id, { price, side });
+      grvtOrdersList.push({ order_id: order.order_id, price, side });
     }
 
     // 4. Get grid levels and sync DB with GRVT reality.
@@ -2951,12 +2946,11 @@ export class GridBotInstance {
     const uncoveredLevels: { level: any, price: number, dist: number }[] = [];
     const isVirtual = !!this.bot.virtual_enabled;
 
-    // Match tolerance: GRVT truncates limit_price to 2 decimals. Multiple
-    // grid levels (spacing 0.0018) can round to the same 2-decimal bucket.
-    // Primary matching is by order_id (from activeOrders); price tolerance
-    // is a fallback for cold-start when activeOrders is empty.
-    const gridStep = (this.bot.upper_price - this.bot.lower_price) / this.bot.num_grids;
-    const matchTolerance = Math.min(0.005, gridStep / 2);
+    // Match tolerance: GRVT truncates limit_price to 2 decimals in responses.
+    // A level at $0.2264 comes back as $0.23 (diff = 0.0036). Tolerance of 0.005
+    // (half cent) covers all possible truncation offsets. With grid spacing of
+    // 0.0018, multiple levels can share a bucket — closest-match disambiguates.
+    const matchTolerance = 0.005;
 
     // Build reverse map: grid_level_id → level, and level.order_id → level
     // for order_id-based matching when the level has a real GRVT order_id.
@@ -2997,21 +2991,28 @@ export class GridBotInstance {
       }
 
       // Strategy 2: match by price with tolerance (fallback for cold-start
-      // or when the level only has a temp order_id).
+      // or when the level only has a temp/0x00 order_id). Use closest-match
+      // among all unconsumed GRVT orders within the tolerance bucket.
       if (!covered) {
-        for (const [gp, grvtOrder] of grvtPrices) {
+        let bestDist = Infinity;
+        let bestOrder: { order_id: string; side: string } | null = null;
+        for (const grvtOrder of grvtOrdersList) {
           if (consumedOrderIds.has(grvtOrder.order_id)) continue;
-          if (Math.abs(gp - lp) < matchTolerance) {
-            await db.updateGridLevel(level.id, {
-              order_id: grvtOrder.order_id,
-              side: grvtOrder.side as 'buy' | 'sell',
-              is_filled: false,
-              state: 'active'
-            });
-            consumedOrderIds.add(grvtOrder.order_id);
-            covered = true;
-            break;
+          const dist = Math.abs(grvtOrder.price - lp);
+          if (dist < matchTolerance && dist < bestDist) {
+            bestDist = dist;
+            bestOrder = grvtOrder;
           }
+        }
+        if (bestOrder) {
+          await db.updateGridLevel(level.id, {
+            order_id: bestOrder.order_id,
+            side: bestOrder.side as 'buy' | 'sell',
+            is_filled: false,
+            state: 'active'
+          });
+          consumedOrderIds.add(bestOrder.order_id);
+          covered = true;
         }
       }
 
