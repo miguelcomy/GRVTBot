@@ -202,6 +202,7 @@ app.get('/api/health', async (req, res) => {
       uptimeHuman,
       activeOrders: (gridEngine as any).activeOrders?.size || 0,
       lastError: null,
+      mockMode: process.env.MOCK_MODE === 'true' || process.env.DRY_RUN === 'true',
       memory: {
         heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
         heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
@@ -1402,7 +1403,7 @@ async function startServer() {
     httpServer.listen(PORT, () => {
       console.log('🔧 Edison: GRVT Grid Bot Dashboard - Fase 3');
       console.log(`🌐 Server: http://localhost:${PORT}`);
-      console.log(`🔐 Auth: ${process.env.DASHBOARD_USER} / ${process.env.DASHBOARD_PASS}`);
+      console.log('🔐 Basic auth (v1) configurado');
       console.log(`💾 Database: SQLite WAL mode`);
       console.log(`🤖 Grid Engine: Listo (no iniciado automáticamente)`);
       console.log('🚀 Dashboard completo - ¡LISTO PARA TRADING!');

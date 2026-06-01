@@ -24,6 +24,7 @@ import { verifyToken } from '../auth/jwt.js';
 const log = childLogger('v2-bootstrap');
 
 interface GrvtClient {
+  readonly mockMode: boolean;
   getInstruments(): Promise<unknown[]>;
   getBalance(): Promise<unknown>;
   getTicker(instrument: string): Promise<unknown>;

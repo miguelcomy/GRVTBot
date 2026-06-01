@@ -45,6 +45,7 @@ interface RawFill {
 }
 
 interface GrvtClient {
+  readonly mockMode: boolean;
   getInstruments(): Promise<unknown[]>;
   getBalance(): Promise<unknown>;
   getTicker(instrument: string): Promise<unknown>;
@@ -2562,6 +2563,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       checks,
       uptime: Math.floor(process.uptime()),
       runningBots: checks.db?.ok ? runningBots : null,
+      mockMode: grvtClient.mockMode,
       cacheSize: cache.size(),
       memory: {
         rss: Math.round(process.memoryUsage().rss / 1024 / 1024),

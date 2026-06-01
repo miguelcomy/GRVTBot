@@ -4,44 +4,83 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 // Hoist mock objects so they're available inside vi.mock factories
-const { mockGrvtClient, mockDb } = vi.hoisted(() => ({
-  mockGrvtClient: {
-    getOpenOrders: vi.fn(),
-    getFillHistory: vi.fn(),
-    getTicker: vi.fn(),
-    getAccountSummary: vi.fn(),
-    createOrder: vi.fn(),
-    cancelOrder: vi.fn(),
-    cancelAllOrders: vi.fn(),
-    getInstruments: vi.fn(),
-    login: vi.fn(),
-  },
-  mockDb: {
-    getBot: vi.fn(),
-    createBot: vi.fn(),
-    updateBot: vi.fn(),
-    getBots: vi.fn(),
-    getGridLevels: vi.fn(),
-    createGridLevel: vi.fn(),
-    updateGridLevel: vi.fn(),
-    fillGridLevel: vi.fn(),
-    createOrder: vi.fn(),
-    updateOrderStatus: vi.fn(),
-    createTrade: vi.fn(),
-    getOrders: vi.fn(),
-    close: vi.fn(),
-    getLastFillArchiveTimestamp: vi.fn(),
-    insertFillArchive: vi.fn(),
-    insertPairedRoundtrip: vi.fn(),
-    getFillsArchive: vi.fn(),
-    getPairedRoundtrips: vi.fn(),
-  },
-}));
+const { mockGrvtClient, mockDb, _roundToTick, _roundToStep, _specsCache, _getSpec, _isSpecFromApi } = vi.hoisted(() => {
+  function decimalPlaces(n: number): number {
+    if (n >= 1) return 0;
+    let d = 0; let x = n;
+    while (x < 1 && d < 20) { x *= 10; d++; }
+    return d;
+  }
+  function roundToTick(price: number, tickSize: number, mode: 'nearest' | 'down' | 'up' = 'nearest'): number {
+    const steps = price / tickSize;
+    let rounded: number;
+    if (mode === 'nearest') rounded = Math.round(steps);
+    else if (mode === 'down') rounded = Math.floor(steps);
+    else rounded = Math.ceil(steps);
+    return parseFloat((rounded * tickSize).toFixed(decimalPlaces(tickSize)));
+  }
+  function roundToStep(qty: number, stepSize: number, mode: 'down' | 'nearest' | 'up' = 'down'): number {
+    const steps = qty / stepSize;
+    let rounded: number;
+    if (mode === 'nearest') rounded = Math.round(steps);
+    else if (mode === 'down') rounded = Math.floor(steps);
+    else rounded = Math.ceil(steps);
+    return parseFloat((rounded * stepSize).toFixed(decimalPlaces(stepSize)));
+  }
+  const specsCache = new Map<string, any>([
+    ['BTC_USDT_Perp', { min_size: 0.001, min_notional: 100, tick_size: 0.1 }],
+    ['ETH_USDT_Perp', { min_size: 0.001, min_notional: 20, tick_size: 0.01 }],
+    ['SOL_USDT_Perp', { min_size: 0.01, min_notional: 5, tick_size: 0.01 }],
+    ['ADA_USDT_Perp', { min_size: 1, min_notional: 5, tick_size: 0.0001 }],
+  ]);
+  return {
+    mockGrvtClient: {
+      getOpenOrders: vi.fn(),
+      getFillHistory: vi.fn(),
+      getTicker: vi.fn(),
+      getAccountSummary: vi.fn(),
+      createOrder: vi.fn(),
+      cancelOrder: vi.fn(),
+      cancelAllOrders: vi.fn(),
+      getInstruments: vi.fn(),
+      login: vi.fn(),
+    },
+    mockDb: {
+      getBot: vi.fn(),
+      createBot: vi.fn(),
+      updateBot: vi.fn(),
+      getBots: vi.fn(),
+      getGridLevels: vi.fn(),
+      createGridLevel: vi.fn(),
+      updateGridLevel: vi.fn(),
+      fillGridLevel: vi.fn(),
+      createOrder: vi.fn(),
+      updateOrderStatus: vi.fn(),
+      createTrade: vi.fn(),
+      getOrders: vi.fn(),
+      close: vi.fn(),
+      getLastFillArchiveTimestamp: vi.fn(),
+      insertFillArchive: vi.fn(),
+      insertPairedRoundtrip: vi.fn(),
+      getFillsArchive: vi.fn(),
+      getPairedRoundtrips: vi.fn(),
+    },
+    _roundToTick: roundToTick,
+    _roundToStep: roundToStep,
+    _specsCache: specsCache,
+    _getSpec: (pair: string) => specsCache.get(pair) ?? { min_size: 0.01, min_notional: 5, tick_size: 0.01 },
+    _isSpecFromApi: () => true,
+  };
+});
 
-// Mock modules using the hoisted objects
 vi.mock('../src/api/client.js', () => ({
   grvtClient: mockGrvtClient,
   GRVTClient: vi.fn(),
+  getInstrumentSpec: _getSpec,
+  isSpecFromApi: _isSpecFromApi,
+  roundToTick: _roundToTick,
+  roundToStep: _roundToStep,
+  instrumentSpecsCache: _specsCache,
 }));
 
 vi.mock('../src/database/db.js', () => ({

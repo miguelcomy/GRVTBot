@@ -8,48 +8,82 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Imported directly — it's a pure function with no side effects.
 // We hoist mocks so the module can load without hitting real DB/API.
 
-const { mockGrvtClient, mockDb } = vi.hoisted(() => ({
-  mockGrvtClient: {
-    getTicker: vi.fn(),
-    calculateLiquidationPrice: vi.fn(),
-    getOpenOrders: vi.fn(),
-    getPosition: vi.fn(),
-    getPositions: vi.fn(),
-    getBalance: vi.fn(),
-    getFillHistory: vi.fn(),
-    getFundingHistory: vi.fn(),
-    createOrder: vi.fn(),
-    cancelOrder: vi.fn(),
-    cancelAllOrders: vi.fn(),
-    setLeverage: vi.fn(),
-    getInstruments: vi.fn(),
-    login: vi.fn(),
-    subAccountId: 'mock-sub',
-  },
-  mockDb: {
-    getBot: vi.fn(),
-    createBot: vi.fn(),
-    updateBot: vi.fn(),
-    getBotsByStatus: vi.fn().mockResolvedValue([]),
-    getAllBots: vi.fn().mockResolvedValue([]),
-    getGridLevels: vi.fn().mockResolvedValue([]),
-    createGridLevel: vi.fn(),
-    updateGridLevel: vi.fn(),
-    fillGridLevel: vi.fn(),
-    createOrder: vi.fn(),
-    updateOrderStatus: vi.fn(),
-    createTrade: vi.fn(),
-    getOrders: vi.fn(),
-    close: vi.fn(),
-    getLastFillArchiveTimestamp: vi.fn(),
-    insertFillArchive: vi.fn(),
-    insertPairedRoundtrip: vi.fn(),
-    getFillsArchive: vi.fn(),
-    getPairedRoundtrips: vi.fn(),
-    getFundingHistoryByBot: vi.fn().mockResolvedValue([]),
-    createFundingRecord: vi.fn(),
-  },
-}));
+const { mockGrvtClient, mockDb, _roundToTick, _roundToStep, _specsCache, _isSpecFromApi } = vi.hoisted(() => {
+  function decimalPlaces(n: number): number {
+    if (n >= 1) return 0;
+    let d = 0; let x = n;
+    while (x < 1 && d < 20) { x *= 10; d++; }
+    return d;
+  }
+  function roundToTick(price: number, tickSize: number, mode: 'nearest' | 'down' | 'up' = 'nearest'): number {
+    const steps = price / tickSize;
+    let rounded: number;
+    if (mode === 'nearest') rounded = Math.round(steps);
+    else if (mode === 'down') rounded = Math.floor(steps);
+    else rounded = Math.ceil(steps);
+    return parseFloat((rounded * tickSize).toFixed(decimalPlaces(tickSize)));
+  }
+  function roundToStep(qty: number, stepSize: number, mode: 'down' | 'nearest' | 'up' = 'down'): number {
+    const steps = qty / stepSize;
+    let rounded: number;
+    if (mode === 'nearest') rounded = Math.round(steps);
+    else if (mode === 'down') rounded = Math.floor(steps);
+    else rounded = Math.ceil(steps);
+    return parseFloat((rounded * stepSize).toFixed(decimalPlaces(stepSize)));
+  }
+  const specsCache = new Map<string, any>([
+    ['BTC_USDT_Perp', { min_size: 0.001, min_notional: 100, tick_size: 0.1 }],
+    ['ETH_USDT_Perp', { min_size: 0.001, min_notional: 20, tick_size: 0.01 }],
+    ['SOL_USDT_Perp', { min_size: 0.01, min_notional: 5, tick_size: 0.01 }],
+    ['ADA_USDT_Perp', { min_size: 1, min_notional: 5, tick_size: 0.0001 }],
+  ]);
+  return {
+    mockGrvtClient: {
+      getTicker: vi.fn(),
+      calculateLiquidationPrice: vi.fn(),
+      getOpenOrders: vi.fn(),
+      getPosition: vi.fn(),
+      getPositions: vi.fn(),
+      getBalance: vi.fn(),
+      getFillHistory: vi.fn(),
+      getFundingHistory: vi.fn(),
+      createOrder: vi.fn(),
+      cancelOrder: vi.fn(),
+      cancelAllOrders: vi.fn(),
+      setLeverage: vi.fn(),
+      getInstruments: vi.fn(),
+      login: vi.fn(),
+      subAccountId: 'mock-sub',
+    },
+    mockDb: {
+      getBot: vi.fn(),
+      createBot: vi.fn(),
+      updateBot: vi.fn(),
+      getBotsByStatus: vi.fn().mockResolvedValue([]),
+      getAllBots: vi.fn().mockResolvedValue([]),
+      getGridLevels: vi.fn().mockResolvedValue([]),
+      createGridLevel: vi.fn(),
+      updateGridLevel: vi.fn(),
+      fillGridLevel: vi.fn(),
+      createOrder: vi.fn(),
+      updateOrderStatus: vi.fn(),
+      createTrade: vi.fn(),
+      getOrders: vi.fn(),
+      close: vi.fn(),
+      getLastFillArchiveTimestamp: vi.fn(),
+      insertFillArchive: vi.fn(),
+      insertPairedRoundtrip: vi.fn(),
+      getFillsArchive: vi.fn(),
+      getPairedRoundtrips: vi.fn(),
+      getFundingHistoryByBot: vi.fn().mockResolvedValue([]),
+      createFundingRecord: vi.fn(),
+    },
+    _roundToTick: roundToTick,
+    _roundToStep: roundToStep,
+    _specsCache: specsCache,
+    _isSpecFromApi: () => true,
+  };
+});
 
 vi.mock('../src/api/client.js', () => ({
   grvtClient: mockGrvtClient,
@@ -58,6 +92,10 @@ vi.mock('../src/api/client.js', () => ({
     if (pair === 'BTC_USDT_Perp') return { min_size: 0.001, min_notional: 100, tick_size: 0.1 };
     return { min_size: 0.01, min_notional: 20, tick_size: 0.01 };
   },
+  isSpecFromApi: _isSpecFromApi,
+  roundToTick: _roundToTick,
+  roundToStep: _roundToStep,
+  instrumentSpecsCache: _specsCache,
   InstrumentSpec: {},
 }));
 
@@ -85,22 +123,24 @@ import { computeLiqPriceLocal, GridEngine } from '../src/bot/grid-engine.js';
 // ── 1. computeLiqPriceLocal ──────────────────────────────────────────
 
 describe('computeLiqPriceLocal', () => {
-  it('LONG 2x entry 60000 → liq ≈ 30300', () => {
+  it('LONG 2x entry 60000 → liq ≈ 30600', () => {
     const liq = computeLiqPriceLocal({
       avg_entry_price: 60000,
       leverage: 2,
       direction: 'long',
     } as any);
-    expect(liq).toBeCloseTo(30300, 0);
+    // factor = 1/2 - 0.01 = 0.49 → liq = 60000 * 0.51 = 30600
+    expect(liq).toBeCloseTo(30600, 0);
   });
 
-  it('SHORT 5x entry 60000 → liq ≈ 71700', () => {
+  it('SHORT 5x entry 60000 → liq ≈ 71400', () => {
     const liq = computeLiqPriceLocal({
       avg_entry_price: 60000,
       leverage: 5,
       direction: 'short',
     } as any);
-    expect(liq).toBeCloseTo(71700, 0);
+    // factor = 1/5 - 0.01 = 0.19 → liq = 60000 * 1.19 = 71400
+    expect(liq).toBeCloseTo(71400, 0);
   });
 
   it('entry = 0 → null (no position)', () => {
@@ -121,8 +161,8 @@ describe('computeLiqPriceLocal', () => {
       leverage: 1,
       direction: 'long',
     } as any);
-    // factor = 1/1 - 0.005 = 0.995 → liq = 60000 * 0.005 = 300
-    expect(liq).toBeCloseTo(300, 0);
+    // factor = 1/1 - 0.01 = 0.99 → liq = 60000 * 0.01 = 600
+    expect(liq).toBeCloseTo(600, 0);
     expect(liq).toBeGreaterThan(0);
   });
 
@@ -132,8 +172,8 @@ describe('computeLiqPriceLocal', () => {
       leverage: 10,
       direction: 'long',
     } as any);
-    // factor = 0.1 - 0.005 = 0.095 → liq = 2000 * (1 - 0.095) = 2000 * 0.905 = 1810
-    expect(liq).toBeCloseTo(1810, 0);
+    // factor = 0.1 - 0.01 = 0.09 → liq = 2000 * (1 - 0.09) = 2000 * 0.91 = 1820
+    expect(liq).toBeCloseTo(1820, 0);
   });
 
   it('SHORT 3x → liq above entry', () => {
@@ -142,7 +182,7 @@ describe('computeLiqPriceLocal', () => {
       leverage: 3,
       direction: 'short',
     } as any);
-    // factor = 1/3 - 0.005 ≈ 0.3283 → liq = 2000 * 1.3283 ≈ 2656.7
+    // factor = 1/3 - 0.01 ≈ 0.3233 → liq = 2000 * 1.3233 ≈ 2646.7
     expect(liq!).toBeGreaterThan(2000);
   });
 });
@@ -307,7 +347,7 @@ describe('GridEngine.calculateGridLevels', () => {
     ).rejects.toThrow(/fuera del rango/);
   });
 
-  it('qty floors at 0.03 for tiny investments', async () => {
+  it('qty floors at min_size for tiny investments', async () => {
     const result = await engine.calculateGridLevels({
       pair: 'ETH_USDT_Perp',
       direction: 'long',
@@ -318,7 +358,8 @@ describe('GridEngine.calculateGridLevels', () => {
       investmentUSDT: 100, // very small
     });
 
-    expect(result.quantityPerGrid).toBeGreaterThanOrEqual(0.03);
+    // Floor is now the instrument's min_size (0.01 for ETH in mock), not hardcoded 0.03
+    expect(result.quantityPerGrid).toBeGreaterThanOrEqual(0.01);
   });
 
   it('liquidation price is included in result', async () => {

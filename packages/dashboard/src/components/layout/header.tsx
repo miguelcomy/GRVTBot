@@ -3,7 +3,7 @@ import { cn } from '@/lib/cn';
 import { useWsStatus } from '@/lib/use-ws-channel';
 import type { WsStatus } from '@/lib/ws-client';
 import { applyThemeToDocument, useUiStore } from '@/stores/ui-store';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { LanguageToggle, useT } from '@/i18n';
 
 const STATUS_KEY: Record<WsStatus, { color: string; key: string }> = {
@@ -26,11 +26,21 @@ export function Header() {
   const styles = STATUS_KEY[status];
   const theme = useUiStore((s) => s.theme);
   const toggleTheme = useUiStore((s) => s.toggleTheme);
+  const [mockMode, setMockMode] = useState(false);
 
   // Re-apply on every theme change so the document attribute stays in sync.
   useEffect(() => {
     applyThemeToDocument(theme);
   }, [theme]);
+
+  // Check backend mock mode from health endpoint
+  useEffect(() => {
+    const apiBase = import.meta.env.VITE_API_BASE || '';
+    fetch(`${apiBase}/api/health`)
+      .then((r) => r.json())
+      .then((data) => setMockMode(data.mockMode === true))
+      .catch(() => {});
+  }, []);
 
   return (
     <header
@@ -48,6 +58,15 @@ export function Header() {
       </div>
 
       <div className="flex-1" />
+
+      {mockMode && (
+        <span
+          className="text-2xs uppercase tracking-wider text-warning border border-warning/40 rounded-md px-2 py-0.5"
+          title="Backend is in MOCK_MODE — no real orders placed"
+        >
+          Mock
+        </span>
+      )}
 
       <div
         className={cn(

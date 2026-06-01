@@ -39,10 +39,11 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs/bot:/app/logs
+      - /etc/grvt-grid/master.key:/etc/grvt-grid/master.key:ro
     ports:
       # Direct port for `--profile no-tls` deployments. With caddy, you can
       # remove this binding so only caddy is reachable from the internet.
-      - "${BOT_PORT:-3848}:3848"
+      - "127.0.0.1:${BOT_PORT:-3848}:3848"
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://127.0.0.1:3848/api/health"]
       interval: 30s

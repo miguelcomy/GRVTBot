@@ -12,7 +12,6 @@ interface ModalProps {
   onClose: () => void;
   title: string;
   description?: string;
-  // 'wide' for wizards, 'regular' for confirms.
   size?: 'regular' | 'wide';
   children: ReactNode;
   footer?: ReactNode;
@@ -36,7 +35,6 @@ export function Modal({
   const titleId = useId();
   const descId = useId();
 
-  // Sync open prop with the imperative dialog API.
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
@@ -47,7 +45,6 @@ export function Modal({
     }
   }, [open]);
 
-  // Close on backdrop click (clicking the dialog element directly = backdrop).
   function handleBackdropClick(e: React.MouseEvent<HTMLDialogElement>) {
     if (e.target === dialogRef.current) onClose();
   }
@@ -58,15 +55,10 @@ export function Modal({
       onClose={onClose}
       onClick={handleBackdropClick}
       className={cn(
-        'p-0 overflow-hidden',
+        'p-0 m-auto',
         'bg-bg-elevated text-text-primary border border-border-default shadow-lg',
         'backdrop:bg-black/70',
-        'open:flex open:flex-col',
-        // Mobile: full-width bottom sheet docked at the bottom of the viewport.
-        // Desktop: centered modal with size cap.
-        'w-full max-h-[92dvh] md:max-h-[85dvh]',
-        'rounded-t-lg md:rounded-lg',
-        'fixed bottom-0 left-0 right-0 m-0 md:static md:m-auto',
+        'w-[calc(100%-2rem)] rounded-lg',
         SIZE_CLASS[size]
       )}
       aria-modal="true"
@@ -74,7 +66,7 @@ export function Modal({
       aria-labelledby={titleId}
       aria-describedby={description ? descId : undefined}
     >
-      <header className="flex items-start justify-between px-6 py-4 border-b border-border-subtle">
+      <div className="flex items-start justify-between px-6 py-4 border-b border-border-subtle">
         <div>
           <h2 id={titleId} className="text-lg font-semibold text-text-primary">
             {title}
@@ -93,14 +85,14 @@ export function Modal({
         >
           <X className="size-4" />
         </button>
-      </header>
+      </div>
 
-      <div className="flex-1 overflow-y-auto px-6 py-5">{children}</div>
+      <div className="px-6 py-5">{children}</div>
 
       {footer && (
-        <footer className="border-t border-border-subtle px-6 py-3 flex items-center justify-end gap-3">
+        <div className="border-t border-border-subtle px-6 py-3 flex items-center justify-end gap-3">
           {footer}
-        </footer>
+        </div>
       )}
     </dialog>
   );
