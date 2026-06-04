@@ -75,9 +75,16 @@ function generateNonce(): number {
 
 /**
  * Generar timestamp de expiración en nanosegundos
- * @param hours Horas hasta la expiración (default: 24h)
+ *
+ * GRVT solo soporta GOOD_TILL_TIME (no GTC real). Las órdenes expiran
+ * al llegar a este timestamp. Usamos 7 días (168h) para minimizar
+ * la frecuencia de re-colocación por expiración.
+ *
+ * ⚠️ Si GRVT rechaza 7 días, reducir a 72h o 48h.
  */
-function generateExpiration(hours: number = 24): string {
+const ORDER_EXPIRATION_HOURS = 168; // 7 días
+
+function generateExpiration(hours: number = ORDER_EXPIRATION_HOURS): string {
   const milliseconds = Date.now() + hours * 3600000;
   return (milliseconds * 1e6).toString(); // Convertir a nanosegundos
 }
@@ -198,7 +205,7 @@ export async function signOrder(
 
   // Generar nonce y expiration
   const nonce = generateNonce();
-  const expiration = generateExpiration(24); // 24 horas
+  const expiration = generateExpiration(); // 7 días (ORDER_EXPIRATION_HOURS)
 
   // Convertir parámetros a formato EIP-712 (formato verificado por Marta)
   const assetID = getAssetId(instrument)!; // checked above

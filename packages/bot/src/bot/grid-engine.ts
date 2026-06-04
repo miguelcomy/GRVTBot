@@ -1360,9 +1360,12 @@ export class GridEngine extends EventEmitter {
 
     // Generate level 0..numGrids = numGrids+1 levels. Every level
     // gets the SAME canonicalQty so the grid is constant-quantity.
+    // GRVT truncates limit_price to 2 decimals in open_orders responses
+    // regardless of tick_size. Round to 2 decimals so DB prices match
+    // what GRVT returns, preventing the create/kill loop.
     const gridLevels = [];
     for (let i = 0; i <= config.numGrids; i++) {
-      const price = roundToTick(config.lowerPrice + (i * spacing), calcSpec.tick_size);
+      const price = Math.round((config.lowerPrice + (i * spacing)) * 100) / 100;
 
       let side: 'buy' | 'sell';
       if (config.direction === 'long') {
@@ -3032,28 +3035,29 @@ export class GridBotInstance {
     // uncoveredLevels = DB levels without GRVT order
     // Sort by distance: closest = natural gap, rest = need orders
     uncoveredLevels.sort((a, b) => a.dist - b.dist);
-    
+
     log.info(`📊 Monitor: ${openOrders.length} GRVT, ${uncoveredLevels.length} uncovered, price $${currentPrice.toFixed(2)}`);
-    
+
+    // ── Fill verification for ALL uncovered levels ──────────────
+    // Previously, the closest uncovered (index 0) was blindly marked as
+    // "gap/filled".  When an order EXPIRES (GOOD_TILL_TIME) instead of
+    // filling, that caused the bot to mark it as filled when it wasn't,
+    // losing the buy/sell opportunity.
+    // Fix: check ALL uncovered levels against fill history FIRST.
+    // Only genuinely-filled levels get marked as filled; expired ones are
+    // re-placed.
     if (uncoveredLevels.length > 0) {
-      // Closest uncovered = natural gap
-      const gap = uncoveredLevels[0]!;
-      log.info(`🕳️ Gap: $${gap.level.price} (dist=$${gap.dist.toFixed(2)})`);
-      await db.updateGridLevel(gap.level.id, { is_filled: true, order_id: '' });
-    }
-    
-    if (uncoveredLevels.length > 1 && openOrders.length < 94) {
       // Check BOTH fill sources ONCE (REST + WS-backed archive).
-      // REST is slower but covers longer history; archive is fresher and
-      // can catch fills inside the 10s placement window where REST lags.
       const recentFills = await this.grvt.getFillHistory(50, this.bot.pair!);
       const archivedFills = await db.findRecentFillsForBot(this.bot.id, 90_000);
       const now = Date.now();
       const fillTolerance = 0.005;
 
-      for (let i = 1; i < uncoveredLevels.length; i++) {
-        const uc = uncoveredLevels[i]!;
+      // Identify which uncovered levels were genuinely filled vs expired/missing
+      const genuinelyFilled: any[] = [];
+      const needReplace: { level: any; price: number; dist: number }[] = [];
 
+      for (const uc of uncoveredLevels) {
         // Check if this was a recent fill (REST)
         const fillMatch = recentFills.find((fill: any) => {
           const fp = parseFloat(fill.price);
@@ -3062,8 +3066,6 @@ export class GridBotInstance {
         });
 
         // Fallback: check local archive (WS-backed, fresher than REST).
-        // Critical for aggressive candles that fill a just-placed counter
-        // before REST getFillHistory catches up.
         const archiveMatch = !fillMatch ? archivedFills.find(f =>
           Math.abs(f.price - uc.level.price) < fillTolerance
         ) : null;
@@ -3079,37 +3081,70 @@ export class GridBotInstance {
               [...this.processedFills].slice(0, 100).forEach(e => this.processedFills.delete(e));
             }
             log.info(`✅ Fill confirmed (${source}): ${uc.level.side} @ $${uc.level.price}`);
-            filledLevels.push(uc.level);
+            genuinelyFilled.push(uc.level);
+          } else {
+            // Already processed fill — still mark as gap
+            genuinelyFilled.push(uc.level);
           }
-          continue;
-        }
-
-        // Not a fill on EITHER source. GRVT-lag guard: if we placed this
-        // level very recently, both openOrders AND fill sources may still
-        // be catching up. Skip this tick to avoid re-placing over what
-        // might already be a live (or recently-filled) order.
-        const placedAt = this.recentlyPlaced.get(uc.level.id);
-        if (placedAt && Date.now() - placedAt < 10_000) {
-          log.info(`⏭️ Skip re-place @ $${uc.level.price}: placed ${((Date.now() - placedAt) / 1000).toFixed(1)}s ago (GRVT lag)`);
-          continue;
-        }
-
-        // Re-place (only if GRVT count allows)
-        const correctSide: 'buy' | 'sell' = uc.price < currentPrice ? 'buy' : 'sell';
-        const newQty = this.getFixedQty();
-        log.info(`⚠️ Re-placing: ${correctSide} ${newQty} @ $${uc.level.price}`);
-        try {
-          await db.updateGridLevel(uc.level.id, { order_id: '0x00', is_filled: false, side: correctSide, quantity: newQty });
-          uc.level.side = correctSide;
-          uc.level.quantity = newQty;
-          await this.placeGridOrder(uc.level);
-          log.info(`✅ Placed: ${correctSide} @ $${uc.level.price}`);
-        } catch (e) {
-          log.info(`❌ Failed: $${uc.level.price}: ${e instanceof Error ? e.message : e}`);
+        } else {
+          needReplace.push(uc);
         }
       }
-    }
-    
+
+      // Mark genuinely filled levels — these trigger counter-order placement
+      for (const fl of genuinelyFilled) {
+        filledLevels.push(fl);
+      }
+
+      // The closest genuinely-filled level = natural gap (no order needed here)
+      // If no fills were found, the closest needReplace is the gap instead
+      const filledGap = uncoveredLevels.find(uc =>
+        genuinelyFilled.some(fl => fl.id === uc.level.id)
+      );
+
+      if (filledGap) {
+        log.info(`🕳️ Gap (filled): $${filledGap.level.price} (dist=$${filledGap.dist.toFixed(2)})`);
+        await db.updateGridLevel(filledGap.level.id, { is_filled: true, order_id: '' });
+      }
+
+      // Re-place levels that were NOT filled (expired / disappeared)
+      if (needReplace.length > 0 && openOrders.length < 94) {
+        // If no level was genuinely filled, the closest needReplace is the gap
+        const replaceStartIdx = filledGap ? 0 : 1;
+        if (!filledGap && needReplace.length > 0) {
+          const gap = needReplace[0]!;
+          log.info(`🕳️ Gap (no fill, expired?): $${gap.level.price} (dist=$${gap.dist.toFixed(2)}) — marking as gap`);
+          await db.updateGridLevel(gap.level.id, { is_filled: true, order_id: '' });
+        }
+
+        for (let i = replaceStartIdx; i < needReplace.length; i++) {
+          const uc = needReplace[i]!;
+
+          // GRVT-lag guard: if we placed this level very recently, both
+          // openOrders AND fill sources may still be catching up.
+          const placedAt = this.recentlyPlaced.get(uc.level.id);
+          if (placedAt && Date.now() - placedAt < 10_000) {
+            log.info(`⏭️ Skip re-place @ $${uc.level.price}: placed ${((Date.now() - placedAt) / 1000).toFixed(1)}s ago (GRVT lag)`);
+            continue;
+          }
+
+          // Re-place (only if GRVT count allows)
+          const correctSide: 'buy' | 'sell' = uc.price < currentPrice ? 'buy' : 'sell';
+          const newQty = this.getFixedQty();
+          log.info(`⚠️ Re-placing: ${correctSide} ${newQty} @ $${uc.level.price}`);
+          try {
+            await db.updateGridLevel(uc.level.id, { order_id: '0x00', is_filled: false, side: correctSide, quantity: newQty });
+            uc.level.side = correctSide;
+            uc.level.quantity = newQty;
+            await this.placeGridOrder(uc.level);
+            log.info(`✅ Placed: ${correctSide} @ $${uc.level.price}`);
+          } catch (e) {
+            log.info(`❌ Failed: $${uc.level.price}: ${e instanceof Error ? e.message : e}`);
+          }
+        }
+      } // end if needReplace
+    } // end if uncoveredLevels.length > 0
+
     // 5.4 VIRTUAL GRID ROTATION (H.8): slide the active window to follow price.
     // Runs before the duplicate killer so rotation-driven cancels aren't misread as duplicates.
     if (isVirtual) {
