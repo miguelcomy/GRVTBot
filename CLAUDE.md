@@ -130,9 +130,27 @@ El bot reportó "running con N niveles" cuando las órdenes realmente fallaron. 
 
 `instrumentSpecsCache` en `client.ts:~177` tiene specs hardcodeadas para pares conocidos (BTC, ETH, SOL, ADA) y un fallback genérico `{tick_size: 0.01}`. Para pares nuevos, las specs se obtienen de la API de GRVT en runtime (`getInstruments()`). Si la API falla, el fallback puede ser incorrecto — verificar.
 
-### 3.9 Commits de los fixes clave (git log)
+### 3.9 GRVT solo soporta GOOD_TILL_TIME (no GTC real)
+
+GRVT **no tiene** `GOOD_TILL_CANCEL`. Solo soporta `GOOD_TILL_TIME`, `IMMEDIATE_OR_CANCEL`, y `FILL_OR_KILL` (confirmado en `grvt-pysdk/grvt_raw_types.py`). Toda orden necesita un timestamp de expiración.
+
+- **Constante en `order-signer.ts:85`**: `ORDER_EXPIRATION_HOURS = 168` (7 días)
+- **Función `generateExpiration()`** en línea ~86: convierte horas a nanosegundos
+- El `timeInForce` numérico `1` (GTC en EIP-712) se mapea a `'GOOD_TILL_TIME'` en `formatSignedOrderForAPI()` (línea ~316)
+- **Antes era 24h** — causaba que órdenes expiraran diario sin que el bot lo supiera
+
+### 3.10 El monitor NO debe asumir "filled" en el gap sin verificar
+
+El monitor loop (`grid-engine.ts:~3048`) detecta niveles "uncovered" (sin orden en GRVT). Antes, el más cercano al precio se marcaba como `is_filled: true` **sin verificar si hubo fill real**. Cuando una orden expiraba (GOOD_TILL_TIME) en vez de ejecutarse, se perdía la oportunidad de compra/venta.
+
+- **Fix**: Todos los niveles uncovered se verifican contra fill history (REST + WS archive) ANTES de decidir. Fill real → counter-order. Sin fill → re-colocar.
+- **Todas las re-colocaciones** pasan por `placeGridOrder()` que hardcodea `post_only: true` (línea 2764) — maker rebate preservado.
+- **Toda orden firmada** pasa por `signOrder()` → `generateExpiration()` → 7 días.
+
+### 3.11 Commits de los fixes clave (git log)
 
 ```
+e3136f6 fix(grid): 7-day order expiration + verify fills before marking gap
 1c91e3a fix(grid): tick-based price matching + idempotent order inserts
 839afe9 fix(grid): GRVT price truncation — order_id matching + wider tolerance
 9da72a9 fix(grid): use list + closest-match for GRVT price bucket disambiguation
