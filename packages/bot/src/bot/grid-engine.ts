@@ -2250,6 +2250,7 @@ export class GridBotInstance {
   // level is treated normally — if GRVT still doesn't show it, the order
   // was cancelled or filled, and the normal flow takes over.
   private recentlyPlaced = new Map<number, number>();
+  private failedPlaceCooldown = new Map<number, number>(); // level.id → timestamp of last 0x00 failure
   // Multi-tenant: per-user GRVT client resolved by GridEngine via
   // getClientForBot(). Falls back to the module-level `grvtClient`
   // singleton only for legacy bots with no user_id (the factory
@@ -2935,17 +2936,13 @@ export class GridBotInstance {
 
       // Si GRVT devuelve 0x00, buscar el order_id real en open_orders.
       // GRVT truncates limit_price to 2 decimals in responses, so a level at
-      // $0.2264 comes back as $0.23. We use a wider tolerance (0.005 = half cent)
-      // and disambiguate by picking the closest match when multiple candidates
-      // fall within the bucket.
+      // GRVT returns 0x00 as order_id when the order is pending or was rejected.
+      // Try to resolve the real ID from open_orders. If not found after retries,
+      // the order was likely rejected — treat as error to prevent phantom orders.
       let realOrderId = order.order_id;
       if (realOrderId === '0x00' || realOrderId === '0x0000000000000000000000000000000000000000000000000000000000000000') {
-        // Try up to 3 times with increasing delay to resolve the real order_id.
-        // GRVT's create_order returns 0x00 immediately; the real ID propagates
-        // to open_orders after a variable delay (1-5s observed).
         const tolerance = 0.005;
         const priceMatch = (o: any) => {
-          // Try legs[0].limit_price first (monitor format), then top-level price (create format)
           const p = o.legs?.[0]?.limit_price ? parseFloat(o.legs[0].limit_price) : parseFloat(o.price || '0');
           return Math.abs(p - level.price) < tolerance;
         };
@@ -2953,18 +2950,13 @@ export class GridBotInstance {
         for (let attempt = 1; attempt <= 3; attempt++) {
           await new Promise(r => setTimeout(r, attempt * 1500));
           const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
-          if (attempt === 1 && openOrders.length > 0) {
-            const sample = openOrders[0] as any;
-            log.info(`[0x00 FIX] DEBUG openOrders sample: order_id=${sample.order_id?.slice(0,20)} price=${sample.price} legs_price=${sample.legs?.[0]?.limit_price} keys=${Object.keys(sample).join(',')}`);
-          }
           const candidates = openOrders.filter(priceMatch);
 
           if (candidates.length === 1) {
             realOrderId = (candidates[0] as any).order_id;
-            log.info(`[0x00 FIX] Replaced 0x00 with real order_id: ${realOrderId.slice(0,20)}... @ $${level.price} (attempt ${attempt})`);
+            log.info(`[0x00 FIX] Resolved real order_id: ${realOrderId.slice(0,20)}... @ $${level.price} (attempt ${attempt})`);
             break;
           } else if (candidates.length > 1) {
-            // Multiple orders at same price — pick closest.
             candidates.sort((a: any, b: any) => {
               const pa = a.legs?.[0]?.limit_price ? parseFloat(a.legs[0].limit_price) : parseFloat(a.price || '0');
               const pb = b.legs?.[0]?.limit_price ? parseFloat(b.legs[0].limit_price) : parseFloat(b.price || '0');
@@ -2978,10 +2970,10 @@ export class GridBotInstance {
           }
         }
 
-        // If all retries failed, use temp ID — monitor will resolve it via Strategy 2
+        // If still 0x00 after all retries, the order was rejected by GRVT.
+        // Throw error so the caller knows — prevents phantom orders and duplicate accumulation.
         if (realOrderId === '0x00' || realOrderId === '0x0000000000000000000000000000000000000000000000000000000000000000') {
-          realOrderId = `temp_${Date.now()}_${level.price}_${Math.random().toString(36).slice(2,8)}`;
-          log.info(`[0x00 FIX] Generated temp ID: ${realOrderId} for $${level.price} (all retries exhausted)`);
+          throw new Error(`GRVT rejected order @ $${level.price} (0x00 unresolved after 3 attempts — likely insufficient margin or rejected)`);
         }
       }
 
@@ -3327,6 +3319,14 @@ export class GridBotInstance {
             continue;
           }
 
+          // Failed-place cooldown: if this level failed with 0x00 recently,
+          // don't retry for 5 minutes to prevent duplicate accumulation.
+          const failedAt = this.failedPlaceCooldown.get(uc.level.id);
+          if (failedAt && Date.now() - failedAt < 300_000) {
+            log.info(`⏭️ Skip re-place @ $${uc.level.price}: failed ${((Date.now() - failedAt) / 1000).toFixed(0)}s ago (cooldown 5m)`);
+            continue;
+          }
+
           // Fix 3: determine side based on GRID DIRECTION, not just current price.
           // Old logic: `uc.price < currentPrice ? 'buy' : 'sell'` — when price is
           // below the ENTIRE grid range, ALL levels were above price and got
@@ -3346,7 +3346,13 @@ export class GridBotInstance {
             await this.placeGridOrder(uc.level);
             log.info(`✅ Placed: ${correctSide} @ $${uc.level.price}`);
           } catch (e) {
-            log.info(`❌ Failed: $${uc.level.price}: ${e instanceof Error ? e.message : e}`);
+            const errMsg = e instanceof Error ? e.message : String(e);
+            log.info(`❌ Failed: $${uc.level.price}: ${errMsg}`);
+            // Track failed placements (0x00 rejection, insufficient margin, etc.)
+            // to prevent immediate retry and duplicate accumulation.
+            this.failedPlaceCooldown.set(uc.level.id, Date.now());
+            // Reset order_id so monitor Strategy 2 can try to resolve it later
+            await db.updateGridLevel(uc.level.id, { order_id: '' });
           }
         }
       } // end if needReplace
