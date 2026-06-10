@@ -3067,6 +3067,14 @@ export class GridBotInstance {
     // 1. Get open orders from GRVT
     const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
     
+    // DEBUG: Log balance every 12 cycles (~1 min) to diagnose margin issues
+    if (this.pnlUpdateCounter - this.lastReconcileTick >= 11) {
+      try {
+        const bal = await this.grvt.getBalance();
+        log.info(`💰 [MARGIN DEBUG] equity=$${bal.total_equity} available=$${bal.available_balance} margin_used=$${bal.margin_used} initial_margin=$${bal.initial_margin}`);
+      } catch (_e) { /* ignore */ }
+    }
+
     // 2. Get current price from the last ticker
     const ticker = await this.grvt.getTicker(this.bot.pair);
     const currentPrice = parseFloat(ticker.last_price);
