@@ -3058,24 +3058,19 @@ export class GridBotInstance {
     // SAFEGUARD:pause which monitorAllBots() catches → pauses the bot.
     // The first tick ALWAYS reconciles (lastReconcileTick starts at 0).
     this.pnlUpdateCounter++;
-    // One-time GRVT cleanup: cancel ALL orders on first cycle to remove stale/ghost orders
+    // One-time GRVT cleanup on first cycle after restart: cancel stale/ghost orders
     if (this.pnlUpdateCounter === 1) {
       try {
         const cancelled = await this.grvt.cancelAllOrders(this.bot.pair);
-        log.info(`🧹 [CLEANUP] Cancelled ${cancelled} stale GRVT orders for ${this.bot.pair}`);
-        const bal = await this.grvt.getBalance();
-        log.info(`💰 [MARGIN-START] equity=$${bal.total_equity} available=$${bal.available_balance} margin_used=$${bal.margin_used} initial_margin=$${bal.initial_margin}`);
+        if (cancelled > 0) {
+          log.info(`🧹 [CLEANUP] Cancelled ${cancelled} stale GRVT orders for ${this.bot.pair}`);
+        }
       } catch (_e) { /* ignore */ }
     }
     if (this.pnlUpdateCounter - this.lastReconcileTick >= 12) {
       this.lastReconcileTick = this.pnlUpdateCounter;
       await this.reconcileWithGRVT();
       // reconcileWithGRVT() updates this.realPosition for the direction guard
-      // Also log balance for margin diagnostics
-      try {
-        const bal = await this.grvt.getBalance();
-        log.info(`💰 [MARGIN] equity=$${bal.total_equity} available=$${bal.available_balance} margin_used=$${bal.margin_used} initial_margin=$${bal.initial_margin}`);
-      } catch (_e) { /* ignore */ }
     }
 
     // 1. Get open orders from GRVT
