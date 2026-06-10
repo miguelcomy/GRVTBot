@@ -3058,9 +3058,11 @@ export class GridBotInstance {
     // SAFEGUARD:pause which monitorAllBots() catches → pauses the bot.
     // The first tick ALWAYS reconciles (lastReconcileTick starts at 0).
     this.pnlUpdateCounter++;
-    // Log balance on first cycle for quick diagnostics
+    // One-time GRVT cleanup: cancel ALL orders on first cycle to remove stale/ghost orders
     if (this.pnlUpdateCounter === 1) {
       try {
+        const cancelled = await this.grvt.cancelAllOrders(this.bot.pair);
+        log.info(`🧹 [CLEANUP] Cancelled ${cancelled} stale GRVT orders for ${this.bot.pair}`);
         const bal = await this.grvt.getBalance();
         log.info(`💰 [MARGIN-START] equity=$${bal.total_equity} available=$${bal.available_balance} margin_used=$${bal.margin_used} initial_margin=$${bal.initial_margin}`);
       } catch (_e) { /* ignore */ }
