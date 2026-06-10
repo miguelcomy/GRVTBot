@@ -136,6 +136,7 @@ export interface OrderParams {
   isMarket?: boolean; // Nuevo: para market orders
   timeInForce?: number; // Nuevo: 1=GTC, 3=IOC
   postOnly?: boolean; // true = maker only, orden se cancela si haría taker
+  reduceOnly?: boolean; // true = can only reduce existing position, never open new
   leverage?: number; // No usado directamente en la firma, pero útil para logging
 }
 
@@ -181,7 +182,7 @@ export async function signOrder(
   params: OrderParams,
   signingCreds?: SigningCreds
 ): Promise<SignedOrder> {
-  const { instrument, side, size, price, isMarket = false, timeInForce = 1, postOnly: postOnlyParam = false } = params;
+  const { instrument, side, size, price, isMarket = false, timeInForce = 1, postOnly: postOnlyParam = false, reduceOnly: reduceOnlyParam = false } = params;
 
   // Validar que tengamos configuración para el instrumento (dinámica via getInstrumentSpec)
   const assetIdCheck = getAssetId(instrument);
@@ -221,7 +222,7 @@ export async function signOrder(
     isMarket: isMarket,
     timeInForce: timeInForce, // 1=GTC, 3=IOC
     postOnly: postOnlyParam,
-    reduceOnly: false,
+    reduceOnly: reduceOnlyParam,
     legs: [
       {
         assetID,
@@ -249,6 +250,7 @@ export async function signOrder(
   console.log(`  Size: ${size} → contractSize: ${contractSize}`);
   console.log(`  Price: ${price || 'N/A'} → limitPrice: ${limitPrice}`);
   console.log(`  TimeInForce: ${timeInForce} (${timeInForce === 1 ? 'GTC' : timeInForce === 3 ? 'IOC' : 'OTHER'})`);
+  console.log(`  ReduceOnly: ${reduceOnlyParam}`);
   console.log(`  Nonce: ${nonce}`);
   console.log(`  Expiration: ${expiration}`);
   

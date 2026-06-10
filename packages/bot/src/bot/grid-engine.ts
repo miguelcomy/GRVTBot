@@ -947,6 +947,11 @@ export class GridEngine extends EventEmitter {
         await instance.placeInitialOrders();
       }
 
+      // Fix 1: Reconcile position with GRVT before going to "running".
+      // Catches direction mismatches early. Throwing here prevents the
+      // status from being set to "running" (the catch below rolls back).
+      await instance.reconcileWithGRVT();
+
       // Actualizar status a running (idem en ambos casos)
       await db.updateBot(botId, { status: 'running' });
 
@@ -1013,6 +1018,11 @@ export class GridEngine extends EventEmitter {
     log.info(
       `✅ Bot ${bot.id} resumed: ${instance.getActiveOrderCount()} órdenes mapeadas a grid levels`
     );
+
+    // Fix 1: Reconcile position with GRVT on resume. If the position has
+    // flipped direction while the bot was running/paused, this will throw
+    // SAFEGUARD:pause and prevent the bot from operating on false state.
+    await instance.reconcileWithGRVT();
   }
 
   /**
@@ -2295,6 +2305,112 @@ export class GridBotInstance {
     return this.gridLevels;
   }
 
+  // ── POSITION RECONCILIATION (Fix 1 + Fix 2) ────────────────────
+  // Tracks the real position from GRVT. Updated by reconcileWithGRVT()
+  // on startup and periodically in the monitor. Used by the direction
+  // guard to block orders that would flip the position.
+  private realPosition: { size: number; side: 'buy' | 'sell' | null } = { size: 0, side: null };
+  // The tick counter at which the last reconciliation ran. Used to throttle
+  // the GRVT API call to once every 12 ticks (~60s at 5s intervals).
+  private lastReconcileTick = 0;
+
+  /**
+   * Reconcile the bot's understanding of its position with GRVT reality.
+   * Called on startup (startBot) and periodically in the monitor loop.
+   *
+   * - Reads the real position from GRVT (getPosition).
+   * - Compares direction and size with the DB (bot.direction / bot.position_size).
+   * - On DIRECTION mismatch (e.g. bot thinks "long" but GRVT shows "sell"):
+   *     → logs prominently, syncs DB to GRVT, throws SAFEGUARD to PAUSE.
+   * - On size mismatch: logs a warning and syncs DB to GRVT.
+   * - Updates this.realPosition for the direction guard in placeGridOrder().
+   *
+   * @throws SAFEGUARD error on direction mismatch (caught by monitorAllBots → pause).
+   */
+  async reconcileWithGRVT(): Promise<void> {
+    let grvtPosition: { size: string; side: string; entry_price: string; unrealized_pnl: string } | null = null;
+    try {
+      grvtPosition = await this.grvt.getPosition(this.bot.pair);
+    } catch (err) {
+      // If GRVT is unreachable, log but don't crash. The direction guard
+      // still uses the last-known realPosition (or zero if never reconciled).
+      log.warn(
+        { err: (err as Error).message },
+        `⚠️ POSITION RECONCILE: could not read GRVT position for bot ${this.bot.id}. ` +
+        `Guard will use last-known state.`
+      );
+      return;
+    }
+
+    // Parse real position
+    const realSize = grvtPosition ? parseFloat(grvtPosition.size) : 0;
+    const realSide = grvtPosition?.side; // 'buy' = long, 'sell' = short, undefined = flat
+
+    // Update in-memory cache for the direction guard
+    this.realPosition = {
+      size: realSize,
+      side: realSide === 'buy' ? 'buy' : realSide === 'sell' ? 'sell' : null,
+    };
+
+    // Determine what GRVT thinks the direction is
+    const grvtDirection: 'long' | 'short' | 'flat' =
+      realSide === 'buy' ? 'long' : realSide === 'sell' ? 'short' : 'flat';
+
+    const configuredDirection = this.bot.direction;
+
+    // ── DIRECTION MISMATCH (critical) ──────────────────────────────
+    // If the bot is configured long but GRVT shows a short position
+    // (or vice-versa), the bot has been operating on a false premise.
+    // PAUSE immediately to prevent further damage.
+    if (
+      grvtDirection !== 'flat' &&
+      grvtDirection !== configuredDirection
+    ) {
+      log.error(
+        `🚨 DIRECTION MISMATCH: bot ${this.bot.id} configured as ${configuredDirection.toUpperCase()} ` +
+        `but GRVT shows ${grvtDirection.toUpperCase()} (${realSize} @ ${grvtPosition?.entry_price}). PAUSING.`
+      );
+
+      // Sync DB to GRVT reality before pausing so the dashboard shows truth
+      const signedSize = grvtDirection === 'short' ? -realSize : realSize;
+      await db.updateBot(this.bot.id, {
+        position_size: signedSize,
+        avg_entry_price: grvtPosition ? parseFloat(grvtPosition.entry_price) : 0,
+      });
+
+      throw new Error(
+        `SAFEGUARD:pause:bot=${this.bot.id}:DIRECTION MISMATCH:config=${configuredDirection}:real=${grvtDirection}:size=${realSize}`
+      );
+    }
+
+    // ── SIZE MISMATCH (warning) ────────────────────────────────────
+    const dbPositionSize = Math.abs(this.bot.position_size || 0);
+    const dbSign = (this.bot.position_size || 0) >= 0 ? 'long' : 'short';
+    if (
+      grvtDirection !== 'flat' &&
+      Math.abs(realSize - dbPositionSize) > 1 // tolerance of 1 unit
+    ) {
+      log.warn(
+        `⚠️ POSITION SIZE DRIFT: bot ${this.bot.id} DB says ${dbSign} ${dbPositionSize}, ` +
+        `GRVT says ${grvtDirection} ${realSize}. Syncing DB to GRVT.`
+      );
+      const signedSize = grvtDirection === 'short' ? -realSize : realSize;
+      await db.updateBot(this.bot.id, {
+        position_size: signedSize,
+        avg_entry_price: grvtPosition ? parseFloat(grvtPosition.entry_price) : 0,
+      });
+      // Refresh in-memory bot
+      this.bot.position_size = signedSize;
+      this.bot.avg_entry_price = grvtPosition ? parseFloat(grvtPosition.entry_price) : 0;
+    }
+
+    if (grvtDirection !== 'flat') {
+      log.info(
+        `✅ POSITION RECONCILE: bot ${this.bot.id} OK — ${grvtDirection} ${realSize} @ ${grvtPosition?.entry_price}`
+      );
+    }
+  }
+
   /**
    * Per-level order qty. Reads from the immutable bot.quantity_per_level
    * column set at bot creation. The legacy version recomputed this from
@@ -2696,6 +2812,49 @@ export class GridBotInstance {
     log.info(`📝 [DEBUG] placeGridOrder() INICIADO - Bot: ${this.bot.id}, Level: ${level.level_index}`);
     log.info(`📝 [DEBUG] placeGridOrder() - Orden: ${level.side} ${level.quantity} ${this.bot.pair} @ $${level.price}`);
 
+    // ── DIRECTION FLIP GUARD (Fix 2) ────────────────────────────────
+    // A grid configured LONG must NEVER place a sell that would make
+    // the net position cross to short (and vice-versa). This blocks
+    // the order and throws SAFEGUARD:pause before it reaches GRVT.
+    //
+    // Uses this.realPosition (kept fresh by reconcileWithGRVT every ~60s).
+    // realPosition.size is always positive (from GRVT), side tells direction.
+    // If realPosition hasn't been populated yet (startup race), skip the
+    // check — the reconciliation will catch mismatches on the next tick.
+    if (this.realPosition.side !== null && this.realPosition.size > 0) {
+      const isLong = this.bot.direction === 'long';
+      // For both long and short, realPosition.size is the absolute position size.
+      // - LONG: position = +size. Selling `qty` leaves position at +(size - qty). Flip when qty > size.
+      // - SHORT: position = -size. Buying `qty` leaves position at -(size - qty). Flip when qty > size.
+      const posSize = this.realPosition.size;
+
+      if (isLong && level.side === 'sell') {
+        const qty = level.quantity;
+        if (qty > posSize) {
+          const overshoot = qty - posSize;
+          log.error(
+            `🚫 DIRECTION GUARD: bot ${this.bot.id} LONG — SELL ${qty} @ $${level.price} ` +
+            `would flip position from +${posSize} to -${overshoot}. BLOCKED.`
+          );
+          throw new Error(
+            `SAFEGUARD:pause:bot=${this.bot.id}:DIRECTION GUARD:LONG sell ${qty} would flip to short (net=${posSize})`
+          );
+        }
+      } else if (!isLong && level.side === 'buy') {
+        const qty = level.quantity;
+        if (qty > posSize) {
+          const overshoot = qty - posSize;
+          log.error(
+            `🚫 DIRECTION GUARD: bot ${this.bot.id} SHORT — BUY ${qty} @ $${level.price} ` +
+            `would flip position from -${posSize} to +${overshoot}. BLOCKED.`
+          );
+          throw new Error(
+            `SAFEGUARD:pause:bot=${this.bot.id}:DIRECTION GUARD:SHORT buy ${qty} would flip to long (net=${posSize})`
+          );
+        }
+      }
+    }
+
     // Record placement time for GRVT-lag guard in monitor. Set BEFORE the
     // async GRVT call so even if the call itself takes a while, subsequent
     // monitor ticks see this level as recently-placed.
@@ -2762,6 +2921,13 @@ export class GridBotInstance {
         type: 'limit',
         time_in_force: 'gtc',
         post_only: true,
+        // Fix 2: reduce_only on close-side orders. For a LONG grid, sells
+        // should ONLY reduce the existing long position — they must NEVER
+        // open a short. For a SHORT grid, buys should only reduce the short.
+        // GRVT will reject the order if it would flip the position, giving
+        // us a second layer of defense beyond the software guard above.
+        reduce_only: (this.bot.direction === 'long' && level.side === 'sell') ||
+                     (this.bot.direction === 'short' && level.side === 'buy'),
         metadata: `grid_${this.bot.id}_${level.level_index}`
       });
 
@@ -2872,7 +3038,19 @@ export class GridBotInstance {
     // 0. Refresh bot config from DB (picks up compound changes)
     const freshBot = await db.getBot(this.bot.id);
     if (freshBot) this.bot = freshBot;
-    
+
+    // 0.5. POSITION RECONCILIATION (Fix 1): every 12 ticks (~60s), read the
+    // real position from GRVT and compare with our DB state. On direction
+    // mismatch (e.g. configured long but GRVT shows short), throws
+    // SAFEGUARD:pause which monitorAllBots() catches → pauses the bot.
+    // The first tick ALWAYS reconciles (lastReconcileTick starts at 0).
+    this.pnlUpdateCounter++;
+    if (this.pnlUpdateCounter - this.lastReconcileTick >= 12) {
+      this.lastReconcileTick = this.pnlUpdateCounter;
+      await this.reconcileWithGRVT();
+      // reconcileWithGRVT() updates this.realPosition for the direction guard
+    }
+
     // 1. Get open orders from GRVT
     const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
     
@@ -3128,10 +3306,18 @@ export class GridBotInstance {
             continue;
           }
 
-          // Re-place (only if GRVT count allows)
-          const correctSide: 'buy' | 'sell' = uc.price < currentPrice ? 'buy' : 'sell';
+          // Fix 3: determine side based on GRID DIRECTION, not just current price.
+          // Old logic: `uc.price < currentPrice ? 'buy' : 'sell'` — when price is
+          // below the ENTIRE grid range, ALL levels were above price and got
+          // assigned 'sell', even levels that should be buys. This caused buy
+          // levels to be re-placed as sells, contributing to the position flip.
+          //
+          // New logic: use the original level's side when available (it was set
+          // at grid creation or by the counter-order logic). Only fall back to
+          // price-based logic when the level has no assigned side.
+          const correctSide: 'buy' | 'sell' = uc.level.side || (uc.price < currentPrice ? 'buy' : 'sell');
           const newQty = this.getFixedQty();
-          log.info(`⚠️ Re-placing: ${correctSide} ${newQty} @ $${uc.level.price}`);
+          log.info(`⚠️ Re-placing: ${correctSide} ${newQty} @ $${uc.level.price} (original side: ${uc.level.side || 'none'})`);
           try {
             await db.updateGridLevel(uc.level.id, { order_id: '0x00', is_filled: false, side: correctSide, quantity: newQty });
             uc.level.side = correctSide;
@@ -3276,8 +3462,31 @@ export class GridBotInstance {
           state: 'active',
         });
       } catch (err: any) {
+        // Fix 3: Log counter-order failures prominently. A failing counter-buy
+        // after a sell means the position is eroding (sell succeeds, buy doesn't).
+        // If this happens repeatedly, the position will flip. Log at WARN level
+        // with a distinctive marker so it's easy to grep.
+        const isMarginError = err.message?.includes('Insufficient margin') || err.message?.includes('2080');
+        const isDirectionGuard = err.message?.includes('DIRECTION GUARD');
+        if (isMarginError) {
+          log.warn(
+            `🚨 COUNTER-ORDER FAILED (margin): bot ${this.bot.id} — ${counterSide} ${finalQty} @ $${counterLevel.price} ` +
+            `after ${level.side} fill @ $${level.price}. Position may be eroding!`
+          );
+        } else if (isDirectionGuard) {
+          log.warn(
+            `🚨 COUNTER-ORDER BLOCKED (direction guard): bot ${this.bot.id} — ${counterSide} ${finalQty} @ $${counterLevel.price}. ` +
+            `The direction guard prevented this order. The reconciliation will pause the bot on next check.`
+          );
+        }
+
         if (err.message?.includes('7201') || err.message?.includes('2090')) {
           log.info(`⚠️ Skipping level ${counterLevelIndex}: ${err.message}`);
+          await db.updateGridLevel(counterLevel.id, { pending_replace: true });
+        } else if (isMarginError) {
+          // Margin failures are transient — mark for retry but also flag the
+          // level so the operator can see something is wrong.
+          log.warn(`⚠️ Counter-order for level ${counterLevelIndex} failed (margin). Marking pending_replace.`);
           await db.updateGridLevel(counterLevel.id, { pending_replace: true });
         }
       }

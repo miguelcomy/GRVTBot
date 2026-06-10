@@ -90,6 +90,7 @@ export interface CreateOrderRequest {
   type: 'limit' | 'market';
   time_in_force?: 'gtc' | 'ioc' | 'fok';
   post_only?: boolean;
+  reduce_only?: boolean;
   metadata?: string;
 }
 
@@ -554,6 +555,7 @@ export class GRVTClient {
         size: request.size,
         price: request.price!,
         postOnly: request.post_only || false,
+        reduceOnly: request.reduce_only || false,
       }, {
         privateKey: sc.privateKey,
         signerAddress: sc.signerAddress,
