@@ -147,9 +147,47 @@ El monitor loop (`grid-engine.ts:~3048`) detecta niveles "uncovered" (sin orden 
 - **Todas las re-colocaciones** pasan por `placeGridOrder()` que hardcodea `post_only: true` (línea 2764) — maker rebate preservado.
 - **Toda orden firmada** pasa por `signOrder()` → `generateExpiration()` → 7 días.
 
-### 3.11 Commits de los fixes clave (git log)
+### 3.11 ⚠️ EL BUG MÁS GRAVE: el bot se voltió a SHORT pensando que era LONG
+
+Esto pasó DOS veces (ADA bot 4, UNI bot 5). El bot reportaba "long 125 UNI" en su DB, pero GRVT mostraba la realidad: **SHORT -125 UNI**. El bot operaba su grilla como si fuera long sobre una posición que en realidad era short. Pérdida real ~$9 + riesgo de liquidación en la dirección opuesta.
+
+**Causa raíz triple:**
+
+1. **El re-place convertía todos los niveles en sells.** El monitor loop (`grid-engine.ts` monitor) tenía esta lógica: `correctSide = uc.price < currentPrice ? 'buy' : 'sell'`. Cuando el precio caía por debajo del rango completo (como pasó con UNI de $2.93 a $2.45), TODOS los niveles quedaban arriba del precio → TODOS se re-asignaban como sell, incluyendo niveles que originalmente eran buy.
+
+2. **Counter-buys fallaban por margen insuficiente** (`Insufficient margin` error 2080). Cada sell que se ejecutaba debía disparar un counter-buy. Pero cuando los counter-buys fallaban, la posición se erosionaba: sell → -5 UNI, counter-buy falla → 0. Tras muchos ciclos, la posición neta cruzó de +57 a -126 UNI.
+
+3. **El bot NUNCA reconciliaba con GRVT.** Confía 100% en su DB (`bot.direction`, `bot.position_size`) y nunca verifica contra la posición real del exchange. `updatePnL()` lee la posición de GRVT para PnL, pero NO compara dirección ni alerta sobre discrepancias.
+
+**Timeline UNI (bot 5, Jun 5 2026):**
+```
+05:43  net +57 (tope, buys llenos durante la bajada)
+06:26  Auto-shift FALLA ×20+ ("Auto-buy deficit 5 ETH exceeds safety cap")
+06:27  Primer sell a $2.45 — fuera del rango $2.56-$3.41
+07:21  Auto-shift SÍ ejecuta → rango $2.011-$2.861
+07:59  net -3 ⚠️ PRIMER CRUCE A SHORT
+20:47  net -126 (máximo negative)
+```
+
+**Fix implementado (commit `8ef6ff2`) — 3 capas de defensa:**
+
+1. **Reconciliación con GRVT** (`reconcileWithGRVT()`): Lee la posición REAL del exchange en startup, resume, y cada ~60s en el monitor. Si la dirección no coincide (config=long, GRVT=short) → sincroniza DB + lanza `SAFEGUARD:pause`. La DB ya NO es la fuente de verdad para la posición.
+
+2. **Direction flip guard** en `placeGridOrder()`: Antes de enviar cualquier orden a GRVT, verifica que no cruzaría la dirección. LONG sell qty > position → BLOQUEADO. SHORT buy qty > position → BLOQUEADO.
+
+3. **`reduce_only` en close-side orders**: Para un grid LONG, las sells llevan `reduce_only: true` en la firma EIP-712. GRVT **físicamente rechaza** la orden si voltearía la posición. Pipeline: `OrderParams.reduceOnly` → `signOrder()` → `formatSignedOrderForAPI()` → GRVT API.
+
+4. **Re-place logic corregido**: Ahora respeta el `level.side` original en vez de re-asignar basándose solo en el precio actual.
+
+**REGLA ABSOLUTA:**
+
+> La posición real SIEMPRE se lee de GRVT (`getPosition`), nunca se asume de la DB. La DB puede mentir. El exchange no. Si hay discrepancia de dirección, el bot se PAUSA inmediatamente.
+
+### 3.12 Commits de los fixes clave (git log)
 
 ```
+8ef6ff2 fix(grid): position reconciliation with GRVT + direction-flip protection (reduce_only + guard)
+971e4b1 docs: add CLAUDE.md lessons 3.9-3.10 (GTT expiration + gap verification)
 e3136f6 fix(grid): 7-day order expiration + verify fills before marking gap
 1c91e3a fix(grid): tick-based price matching + idempotent order inserts
 839afe9 fix(grid): GRVT price truncation — order_id matching + wider tolerance
@@ -169,19 +207,29 @@ Ver `NOTES.md` para el análisis detallado del bug de ADA (causa raíz, 3 commit
 |-------|-------|
 | **ID** | 5 |
 | **Par** | `UNI_USDT_Perp` |
-| **Dirección** | long |
+| **Status** | ⏸️ **PAUSADO** — posición cerrada manualmente tras detectar volteo a short |
+| **Dirección** | long (config) — pero llegó a estar net short -126 UNI real |
 | **Leverage** | 4x |
-| **Rango** | $2.56 – $3.41 |
-| **Niveles** | 50 (+ 1 filled gap) |
+| **Rango** | $2.011 – $2.861 (auto-shifted desde $2.56-$3.41) |
+| **Niveles** | 50 |
 | **Qty/nivel** | 5 UNI |
-| **Inversión** | $200 |
+| **Inversión** | $200 original |
+| **PnL total** | ~$17.15 antes del cierre (8 días, 163 roundtrips) |
 | **Safeguard** | Enabled, 10%, action=pause |
 | **Auto-shift** | Enabled |
-| **Stop-loss** | ❌ No configurado (`sl_pct = null`) |
+
+### ⚠️ PRÓXIMO PASO: recrear bot limpio
+
+El bot 5 está pausado con posición cerrada. Antes de reactivar:
+1. Verificar que el deploy con los fixes de `8ef6ff2` está corriendo en el container
+2. Crear bot nuevo (o resetear niveles del bot 5) con range centrado en precio actual de UNI
+3. Confirmar leverage 4x en la UI de GRVT
+4. Iniciar y verificar que `reconcileWithGRVT()` muestra `POSITION RECONCILE: OK` en logs
 
 ### Bots inactivos (historial)
 
 - IDs 2, 3, 4 — todos `ADA_USDT_Perp`, todos `stopped`. El bot 4 fue el que sufrió el bug de truncamiento.
+- ID 5 — `UNI_USDT_Perp`, pausado tras volteo de posición (lección 3.11).
 
 ### Pendientes conocidos
 
