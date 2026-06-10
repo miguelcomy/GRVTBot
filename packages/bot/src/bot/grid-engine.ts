@@ -2953,6 +2953,10 @@ export class GridBotInstance {
         for (let attempt = 1; attempt <= 3; attempt++) {
           await new Promise(r => setTimeout(r, attempt * 1500));
           const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
+          if (attempt === 1 && openOrders.length > 0) {
+            const sample = openOrders[0] as any;
+            log.info(`[0x00 FIX] DEBUG openOrders sample: order_id=${sample.order_id?.slice(0,20)} price=${sample.price} legs_price=${sample.legs?.[0]?.limit_price} keys=${Object.keys(sample).join(',')}`);
+          }
           const candidates = openOrders.filter(priceMatch);
 
           if (candidates.length === 1) {
