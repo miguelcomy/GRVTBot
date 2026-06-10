@@ -2940,32 +2940,44 @@ export class GridBotInstance {
       // fall within the bucket.
       let realOrderId = order.order_id;
       if (realOrderId === '0x00' || realOrderId === '0x0000000000000000000000000000000000000000000000000000000000000000') {
-        await new Promise(r => setTimeout(r, 2000));
-
-        const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
-        // GRVT truncates to 2 decimals: tolerance of 0.005 covers the full
-        // ±0.005 range around each 2-decimal bucket boundary.
+        // Try up to 3 times with increasing delay to resolve the real order_id.
+        // GRVT's create_order returns 0x00 immediately; the real ID propagates
+        // to open_orders after a variable delay (1-5s observed).
         const tolerance = 0.005;
-        const candidates = openOrders.filter((o: any) => {
-          const orderPrice = o.legs?.[0]?.limit_price ? parseFloat(o.legs[0].limit_price) : 0;
-          return Math.abs(orderPrice - level.price) < tolerance;
-        });
-        if (candidates.length === 1) {
-          realOrderId = (candidates[0] as any).order_id;
-          log.info(`[0x00 FIX] Replaced 0x00 with real order_id: ${realOrderId.slice(0,20)}... @ $${level.price}`);
-        } else if (candidates.length > 1) {
-          // Multiple orders in same 2-decimal bucket — pick closest.
-          // This can happen during bootstrap when many orders land at once.
-          candidates.sort((a: any, b: any) => {
-            const da = Math.abs(parseFloat(a.legs?.[0]?.limit_price || '0') - level.price);
-            const db = Math.abs(parseFloat(b.legs?.[0]?.limit_price || '0') - level.price);
-            return da - db;
-          });
-          realOrderId = (candidates[0] as any).order_id;
-          log.info(`[0x00 FIX] Ambiguous match (${candidates.length} candidates) — picked closest: ${realOrderId.slice(0,20)}... @ $${level.price}`);
-        } else {
+        const priceMatch = (o: any) => {
+          // Try legs[0].limit_price first (monitor format), then top-level price (create format)
+          const p = o.legs?.[0]?.limit_price ? parseFloat(o.legs[0].limit_price) : parseFloat(o.price || '0');
+          return Math.abs(p - level.price) < tolerance;
+        };
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          await new Promise(r => setTimeout(r, attempt * 1500));
+          const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
+          const candidates = openOrders.filter(priceMatch);
+
+          if (candidates.length === 1) {
+            realOrderId = (candidates[0] as any).order_id;
+            log.info(`[0x00 FIX] Replaced 0x00 with real order_id: ${realOrderId.slice(0,20)}... @ $${level.price} (attempt ${attempt})`);
+            break;
+          } else if (candidates.length > 1) {
+            // Multiple orders at same price — pick closest.
+            candidates.sort((a: any, b: any) => {
+              const pa = a.legs?.[0]?.limit_price ? parseFloat(a.legs[0].limit_price) : parseFloat(a.price || '0');
+              const pb = b.legs?.[0]?.limit_price ? parseFloat(b.legs[0].limit_price) : parseFloat(b.price || '0');
+              return Math.abs(pa - level.price) - Math.abs(pb - level.price);
+            });
+            realOrderId = (candidates[0] as any).order_id;
+            log.info(`[0x00 FIX] Ambiguous match (${candidates.length} candidates) — picked closest: ${realOrderId.slice(0,20)}... @ $${level.price} (attempt ${attempt})`);
+            break;
+          } else if (attempt < 3) {
+            log.info(`[0x00 FIX] No candidates for $${level.price} (attempt ${attempt}), retrying...`);
+          }
+        }
+
+        // If all retries failed, use temp ID — monitor will resolve it via Strategy 2
+        if (realOrderId === '0x00' || realOrderId === '0x0000000000000000000000000000000000000000000000000000000000000000') {
           realOrderId = `temp_${Date.now()}_${level.price}_${Math.random().toString(36).slice(2,8)}`;
-          log.info(`[0x00 FIX] Generated temp ID: ${realOrderId} for $${level.price}`);
+          log.info(`[0x00 FIX] Generated temp ID: ${realOrderId} for $${level.price} (all retries exhausted)`);
         }
       }
 
@@ -2997,6 +3009,11 @@ export class GridBotInstance {
       } as any);
 
       log.info(`📝 ✅ Orden creada: ${level.side} ${level.quantity} ${this.bot.pair} @ $${level.price} (ID: ${realOrderId}) [notional: $${notional.toFixed(2)}]`);
+
+      // Update grid_levels with the resolved order_id (real or temp).
+      // Without this, the level stays at '0x00' and the next monitor cycle
+      // sees it as uncovered → infinite re-place loop.
+      await db.updateGridLevel(level.id, { order_id: realOrderId });
 
     } catch (error) {
       log.error({ err: (error as Error).message }, `❌ [DEBUG] Error colocando orden en nivel ${level.level_index}:`);
