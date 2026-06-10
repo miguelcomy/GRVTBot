@@ -179,6 +179,7 @@ export const instrumentSpecsCache = new Map<string, InstrumentSpec>([
   ['BTC_USDT_Perp', { min_size: 0.001, min_notional: 100, tick_size: 0.1, instrument_hash: '0x030501', base_decimals: 9 }],
   ['ETH_USDT_Perp', { min_size: 0.001, min_notional: 20, tick_size: 0.01, instrument_hash: '0x030401', base_decimals: 9 }],
   ['SOL_USDT_Perp', { min_size: 0.01, min_notional: 5, tick_size: 0.01, base_decimals: 9 }],
+  ['UNI_USDT_Perp', { min_size: 1, min_notional: 5, tick_size: 0.001, instrument_hash: '0x032c01', base_decimals: 6 }],
   ['ADA_USDT_Perp', { min_size: 1, min_notional: 5, tick_size: 0.0001, instrument_hash: '0x032101', base_decimals: 6 }],
 ]);
 
