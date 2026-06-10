@@ -3058,22 +3058,26 @@ export class GridBotInstance {
     // SAFEGUARD:pause which monitorAllBots() catches → pauses the bot.
     // The first tick ALWAYS reconciles (lastReconcileTick starts at 0).
     this.pnlUpdateCounter++;
+    // Log balance on first cycle for quick diagnostics
+    if (this.pnlUpdateCounter === 1) {
+      try {
+        const bal = await this.grvt.getBalance();
+        log.info(`💰 [MARGIN-START] equity=$${bal.total_equity} available=$${bal.available_balance} margin_used=$${bal.margin_used} initial_margin=$${bal.initial_margin}`);
+      } catch (_e) { /* ignore */ }
+    }
     if (this.pnlUpdateCounter - this.lastReconcileTick >= 12) {
       this.lastReconcileTick = this.pnlUpdateCounter;
       await this.reconcileWithGRVT();
       // reconcileWithGRVT() updates this.realPosition for the direction guard
+      // Also log balance for margin diagnostics
+      try {
+        const bal = await this.grvt.getBalance();
+        log.info(`💰 [MARGIN] equity=$${bal.total_equity} available=$${bal.available_balance} margin_used=$${bal.margin_used} initial_margin=$${bal.initial_margin}`);
+      } catch (_e) { /* ignore */ }
     }
 
     // 1. Get open orders from GRVT
     const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
-    
-    // DEBUG: Log balance every 12 cycles (~1 min) to diagnose margin issues
-    if (this.pnlUpdateCounter - this.lastReconcileTick >= 11) {
-      try {
-        const bal = await this.grvt.getBalance();
-        log.info(`💰 [MARGIN DEBUG] equity=$${bal.total_equity} available=$${bal.available_balance} margin_used=$${bal.margin_used} initial_margin=$${bal.initial_margin}`);
-      } catch (_e) { /* ignore */ }
-    }
 
     // 2. Get current price from the last ticker
     const ticker = await this.grvt.getTicker(this.bot.pair);
