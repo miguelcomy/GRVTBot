@@ -165,10 +165,18 @@ export interface RangeUpdateInputs {
   minSize?: number;
 }
 
-const MAX_AUTO_BUY_ETH = 2.0;
+// H.11: USD-denominated cap. The old per-unit cap (2.0 "ETH") was blind to
+// asset price — fine for ETH (~$3k) but made auto-shift impossible on cheap
+// bases like UNI ($3), where 2 units = $6 blocks any grid with >2 sells.
+const MAX_AUTO_BUY_USD = 150.0;
 const MIN_LOWER_DISTANCE_PCT = 0.5;
 const MAX_UPPER_DISTANCE_PCT = 2.0;
 const AUTO_BUY_SLIPPAGE_PCT = 0.5;
+// Backoff applied to EVERY auto-shift attempt (success or failure). The
+// persisted last_auto_shift_at only gates successful shifts (1h), so without
+// this a persistently-blocked shift (e.g. safety cap) would retry every
+// monitor cycle (~5s) forever, flooding logs. See H.11.
+const AUTO_SHIFT_BACKOFF_MS = 5 * 60_000;
 
 export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePlan {
   const { bot, newLower, newUpper, currentPrice, currentPosition, existingLevels, positionReadError } = input;
@@ -225,16 +233,18 @@ export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePla
   const ethDeficit = Math.max(0, ethNeeded - currentPosition);
   const ethExcess = Math.max(0, currentPosition - ethNeeded);
 
-  if (ethDeficit > MAX_AUTO_BUY_ETH) {
-    safetyViolations.push(
-      `Auto-buy deficit ${ethDeficit.toFixed(4)} ETH exceeds safety cap of ${MAX_AUTO_BUY_ETH} ETH`
-    );
-  }
-
   const autoBuyAggressivePrice =
     roundToTick(currentPrice * (1 + AUTO_BUY_SLIPPAGE_PCT / 100), tickSize, 'up');
   const autoBuyEstimatedCost = ethDeficit * autoBuyAggressivePrice;
   const autoBuySlippageCostUsd = ethDeficit * currentPrice * (AUTO_BUY_SLIPPAGE_PCT / 100);
+
+  // H.11: cap the auto market-buy by USD notional, not raw base units, so the
+  // cap stays meaningful regardless of asset price (see MAX_AUTO_BUY_USD).
+  if (autoBuyEstimatedCost > MAX_AUTO_BUY_USD) {
+    safetyViolations.push(
+      `Auto-buy deficit ${ethDeficit.toFixed(4)} ($${autoBuyEstimatedCost.toFixed(2)}) exceeds safety cap of $${MAX_AUTO_BUY_USD}`
+    );
+  }
 
   const ordersToCancel = existingLevels
     .filter((l) =>
@@ -360,6 +370,7 @@ export function computeLiqPriceLocal(bot: GridBot): number | null {
  */
 export class GridEngine extends EventEmitter {
   private bots = new Map<number, GridBotInstance>();
+  private lastAutoShiftAttemptAt = new Map<number, number>(); // botId → timestamp of last auto-shift attempt (success or fail) — H.11
   private monitoringInterval: NodeJS.Timeout | null = null;
   private fundingPollingInterval: NodeJS.Timeout | null = null; // ⚠️ NUEVO: Polling funding
   private dailySnapshotInterval: NodeJS.Timeout | null = null; // ⚠️ NUEVO: Daily snapshots
@@ -1273,9 +1284,15 @@ export class GridEngine extends EventEmitter {
       if (!req) continue;
       instance.autoShiftRequested = null;
 
+      // H.11: rate-limit attempts (not just successes) so a shift blocked by
+      // a safety cap can't retry every monitor cycle and flood the log.
+      const lastAttempt = this.lastAutoShiftAttemptAt.get(botId) ?? 0;
+      if (Date.now() - lastAttempt < AUTO_SHIFT_BACKOFF_MS) continue;
+      this.lastAutoShiftAttemptAt.set(botId, Date.now());
+
       const bot = instance.getBot();
       const lastShift = bot.last_auto_shift_at ?? 0;
-      if (Date.now() - lastShift < 3600_000) continue; // max once/hour
+      if (Date.now() - lastShift < 3600_000) continue; // max once/hour after success
 
       const rangeWidth = bot.upper_price - bot.lower_price;
       const shiftSpec = getInstrumentSpec(bot.pair);
@@ -1858,7 +1875,7 @@ export class GridEngine extends EventEmitter {
   //   updates bot.lower_price / upper_price. Releases mutex in finally.
   //
   // Safety caps (hard, non-overrideable from the API layer):
-  //   MAX_AUTO_BUY_ETH        = 2.0   ETH absolute cap on market buy
+  //   MAX_AUTO_BUY_USD        = $150  USD notional cap on the deficit market buy
   //   MAX_RANGE_DRIFT_PCT     = 50%   |new mid - current price| cap
   //   MIN_LOWER_DISTANCE_PCT  = 50%   newLower must be ≥ 0.5 × current
   //   MAX_UPPER_DISTANCE_PCT  = 200%  newUpper must be ≤ 2.0 × current
