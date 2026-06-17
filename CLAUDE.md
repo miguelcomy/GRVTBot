@@ -183,9 +183,30 @@ Esto pasó DOS veces (ADA bot 4, UNI bot 5). El bot reportaba "long 125 UNI" en 
 
 > La posición real SIEMPRE se lee de GRVT (`getPosition`), nunca se asume de la DB. La DB puede mentir. El exchange no. Si hay discrepancia de dirección, el bot se PAUSA inmediatamente.
 
-### 3.12 Commits de los fixes clave (git log)
+### 3.12 Auto-shift se queda trabado cuando el precio sale del rango (cap ciego al precio + throttle roto)
+
+Cuando UNI pumpió +47% (de $2.50 a $3.64), el rango del bot 7 ($2.40-$2.84) quedó enteramente por debajo del mercado. El auto-shift **detectaba** el out-of-range y **calculaba bien** el rango nuevo, pero un safety guard lo rechazaba en bucle cada ~5s:
 
 ```
+Range update refused: Auto-buy deficit 79.0000 ETH exceeds safety cap of 2 ETH
+```
+
+**Causa raíz doble (commit `6928d6e`):**
+
+1. **El cap era ciego al precio del activo.** `MAX_AUTO_BUY_ETH = 2.0` era un cap en *unidades de base*, no en USD. Para ETH (~$3500) eran ~$7000 → razonable. **Para UNI ($3) eran $6** → bloqueaba cualquier grid con más de 2 sells, haciendo el auto-shift imposible en activos baratos. Fix: `MAX_AUTO_BUY_USD = 150` comparando contra `autoBuyEstimatedCost` (que ya se calcula en USD).
+
+2. **El throttle solo se activaba con éxito.** `last_auto_shift_at` se seteaba solo si el shift funcionaba. Como NUNCA funcionaba (lo bloqueaba el cap), quedaba `null` → el check `Date.now() - 0 < 3600_000` nunca aplicaba → **reintentaba cada ciclo del monitor (~5s) para siempre**, inundando los logs. Fix: backoff in-memory por bot (`AUTO_SHIFT_BACKOFF_MS = 5min`) que aplica a TODOS los intentos, no solo éxitos.
+
+**Lección derivada:**
+
+> Un safety cap expresado en unidades del activo (no en USD) es un bug latente: funciona para el activo con el que se probó (ETH) y rompe para cualquier otro precio. Los caps de dinero deben ser en USD o % de equity. Y los throttles deben contar intentos (éxito o fallo), no solo éxitos — si no, un fallo persistente se convierte en loop infinito.
+
+**Detalle operativo del recenter (bot 7, Jun 17 2026):** con el cap arreglado, el recenter vía `POST /api/v2/bots/:id/range` funciona. Notar que `num_grids` limita los sells posibles: con `reduce_only` (lección 3.11), los sells ≈ posición/qty. Con ~40-50 UNI y qty 5 → ~8-10 sells → **num_grids ≈ 16-20**. Más grids exige más posición. Y al recenter con el bot **pausado**, el paso 5 (placement) se skipea (el bot no está en `this.bots`) — las órdenes las coloca el monitor al arrancar (dejar `order_id=NULL` en los niveles nuevos, no `0x00`, para no-trigger el cooldown del fix 0x00).
+
+### 3.13 Commits de los fixes clave (git log)
+
+```
+6928d6e fix(grid): USD-based auto-buy cap + backoff on failed auto-shift
 8ef6ff2 fix(grid): position reconciliation with GRVT + direction-flip protection (reduce_only + guard)
 971e4b1 docs: add CLAUDE.md lessons 3.9-3.10 (GTT expiration + gap verification)
 e3136f6 fix(grid): 7-day order expiration + verify fills before marking gap
